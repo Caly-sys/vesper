@@ -76,25 +76,62 @@ pub fn open_external(target: &str) -> Result<(), String> {
     }
 }
 
-/// Open Windows Explorer focused on a specific file or folder
-pub fn open_folder(path: &Path) -> Result<(), String> {
+/// Open Windows Explorer focused on a specific file or folder.
+/// If the file exists, it is selected using `/select,"path"`.
+/// If the file does not exist yet, its parent or the fallback directory is opened directly.
+pub fn open_folder(path: &Path, fallback_dir: Option<&Path>) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("explorer");
-        if path.is_file() {
-            cmd.arg(format!("/select,\"{}\"", path.display()));
+
+        let clean_str = |p: &Path| -> String {
+            let s = p.to_string_lossy();
+            let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+            stripped.replace('/', "\\")
+        };
+
+        let mut cmd = std::process::Command::new("explorer.exe");
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+        if path.exists() {
+            let clean = clean_str(path);
+            if path.is_file() {
+                cmd.raw_arg(format!("/select,\"{}\"", clean));
+            } else {
+                cmd.raw_arg(format!("\"{}\"", clean));
+            }
         } else {
-            cmd.arg(path.as_os_str());
+            let target_dir = path
+                .parent()
+                .filter(|p| p.exists())
+                .or_else(|| fallback_dir.filter(|p| p.exists()));
+
+            let dir_to_open = match target_dir {
+                Some(dir) => dir.to_path_buf(),
+                None => {
+                    let fallback = fallback_dir.unwrap_or(path);
+                    let _ = std::fs::create_dir_all(fallback);
+                    fallback.to_path_buf()
+                }
+            };
+            let clean = clean_str(&dir_to_open);
+            cmd.raw_arg(format!("\"{}\"", clean));
         }
-        cmd.creation_flags(0x08000000)
-            .spawn()
+
+        cmd.spawn()
             .map_err(|e| format!("Failed to open Explorer: {e}"))?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        open_external(&path.to_string_lossy())
+        let target = if path.exists() {
+            path
+        } else if let Some(fb) = fallback_dir {
+            fb
+        } else {
+            path
+        };
+        open_external(&target.to_string_lossy())
     }
 }
 

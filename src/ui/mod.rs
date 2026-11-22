@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, TPM_BOTTOMALIGN, TPM_RETURNCMD, WINDOW_EX_STYLE,
     WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_POPUP, WS_VISIBLE,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -39,11 +39,12 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::types::{
-    AppEvent, BatchMode, NyaaCategory, NyaaFilter, NyaaItem, PlayerCommand, StreamStatus, SubCue,
+    AppEvent, BatchMode, BufferingStatus, NyaaCategory, NyaaFilter, NyaaItem, PlayerCommand,
+    StreamStatus, SubCue,
 };
 use crate::ui::controls::{format_time, render_ui, HoverControl, Tab, UiState};
 use crate::ui::layout::{LayoutGeometry, Rect};
-use crate::ui::theme::{COLOR_VIEWPORT_BG, DoubleBuffer, ThemeFonts};
+use crate::ui::theme::{COLOR_SURFACE, COLOR_VIEWPORT_BG, DoubleBuffer, ThemeFonts};
 
 /// Actions emitted by the UI for the main application / orchestrator loop to process
 #[derive(Debug, Clone, PartialEq)]
@@ -188,10 +189,35 @@ unsafe extern "system" fn bottom_bar_wndproc(
     }
 }
 
+unsafe extern "system" fn pill_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_NCHITTEST => LRESULT(-1), // HTTRANSPARENT: let clicks pass straight through
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => LRESULT(1),
+        windows::Win32::UI::WindowsAndMessaging::WM_PAINT => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut VesperUi;
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !ptr.is_null() {
+                let ui = &mut *ptr;
+                ui.render_pill_overlay(hdc);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 pub struct VesperUi {
     parent_hwnd: HWND,
     video_child_hwnd: HWND,
     pub bar_hwnd: HWND,
+    pub pill_hwnd: HWND,
     event_proxy: EventLoopProxy<AppEvent>,
     action_queue: VecDeque<UiAction>,
     geom: LayoutGeometry,
@@ -199,6 +225,7 @@ pub struct VesperUi {
     fonts: ThemeFonts,
     double_buffer: DoubleBuffer,
     bar_double_buffer: DoubleBuffer,
+    pill_double_buffer: DoubleBuffer,
     pub width: u32,
     pub height: u32,
     modifiers: ModifiersState,
@@ -364,10 +391,59 @@ impl VesperUi {
             .unwrap_or_default()
         };
 
+        let pill_class_name: Vec<u16> = "VesperPillOverlay\0".encode_utf16().collect();
+        let pill_brush = unsafe { CreateSolidBrush(COLOR_SURFACE) };
+        let pill_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(pill_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: HICON::default(),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
+            hbrBackground: pill_brush,
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR::from_raw(pill_class_name.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        unsafe {
+            let _ = RegisterClassExW(&pill_wc);
+        }
+
+        let pill_w = 240;
+        let pill_h = 38;
+        let mut pill_screen_pt = POINT {
+            x: geom.video_rect.x + (geom.video_rect.w - pill_w) / 2,
+            y: geom.video_rect.y + (geom.video_rect.h - pill_h) / 2,
+        };
+        unsafe {
+            let _ = ClientToScreen(parent_hwnd, &mut pill_screen_pt);
+        }
+
+        let pill_hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                PCWSTR::from_raw(pill_class_name.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                pill_screen_pt.x,
+                pill_screen_pt.y,
+                pill_w,
+                pill_h,
+                Some(parent_hwnd),
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap_or_default()
+        };
+
         Self {
             parent_hwnd,
             video_child_hwnd,
             bar_hwnd,
+            pill_hwnd,
             event_proxy,
             action_queue: VecDeque::new(),
             geom,
@@ -375,6 +451,7 @@ impl VesperUi {
             fonts: ThemeFonts::new(),
             double_buffer: DoubleBuffer::new(),
             bar_double_buffer: DoubleBuffer::new(),
+            pill_double_buffer: DoubleBuffer::new(),
             width,
             height,
             modifiers: ModifiersState::empty(),
@@ -390,6 +467,11 @@ impl VesperUi {
                 GWLP_USERDATA,
                 self as *mut VesperUi as isize,
             );
+            SetWindowLongPtrW(
+                self.pill_hwnd,
+                GWLP_USERDATA,
+                self as *mut VesperUi as isize,
+            );
         }
         self.sync_overlay_position();
     }
@@ -397,24 +479,44 @@ impl VesperUi {
     /// Sync overlay screen position and width with main window
     pub fn sync_overlay_position(&mut self) {
         unsafe {
-            if self.parent_hwnd.is_invalid() || self.bar_hwnd.is_invalid() {
+            if self.parent_hwnd.is_invalid() {
                 return;
             }
-            let mut screen_pt = POINT {
-                x: 0,
-                y: (self.height as i32 - 54).max(0),
-            };
-            let _ = ClientToScreen(self.parent_hwnd, &mut screen_pt);
-            let bar_w = self.geom.video_rect.w;
-            let _ = SetWindowPos(
-                self.bar_hwnd,
-                None,
-                screen_pt.x,
-                screen_pt.y,
-                bar_w,
-                54,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            if !self.bar_hwnd.is_invalid() {
+                let mut screen_pt = POINT {
+                    x: 0,
+                    y: (self.height as i32 - 54).max(0),
+                };
+                let _ = ClientToScreen(self.parent_hwnd, &mut screen_pt);
+                let bar_w = self.geom.video_rect.w;
+                let _ = SetWindowPos(
+                    self.bar_hwnd,
+                    None,
+                    screen_pt.x,
+                    screen_pt.y,
+                    bar_w,
+                    54,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            if !self.pill_hwnd.is_invalid() {
+                let pill_w = 240;
+                let pill_h = 38;
+                let mut pill_screen_pt = POINT {
+                    x: self.geom.video_rect.x + (self.geom.video_rect.w - pill_w) / 2,
+                    y: self.geom.video_rect.y + (self.geom.video_rect.h - pill_h) / 2,
+                };
+                let _ = ClientToScreen(self.parent_hwnd, &mut pill_screen_pt);
+                let _ = SetWindowPos(
+                    self.pill_hwnd,
+                    None,
+                    pill_screen_pt.x,
+                    pill_screen_pt.y,
+                    pill_w,
+                    pill_h,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
         }
     }
 
@@ -491,6 +593,69 @@ impl VesperUi {
             controls::render_bottom_bar(mem_dc, &self.geom, &self.state, &self.fonts);
             self.bar_double_buffer.present(hdc, 0, 0, bar_w, bar_h);
         }
+    }
+
+    /// Render floating mid-playback rebuffering pill
+    pub fn render_pill_overlay(&mut self, hdc: HDC) {
+        let pill_w = 240;
+        let pill_h = 38;
+        self.pill_double_buffer.ensure_size(hdc, pill_w, pill_h);
+
+        if let Some(mem_dc) = self.pill_double_buffer.mem_dc {
+            controls::render_rebuffering_pill(mem_dc, pill_w, pill_h, &self.state, &self.fonts);
+            self.pill_double_buffer.present(hdc, 0, 0, pill_w, pill_h);
+        }
+    }
+
+    /// Show or hide mid-playback rebuffering pill overlay
+    pub fn set_rebuffering(&mut self, is_buffering: bool, percent: i64) {
+        self.state.is_rebuffering = is_buffering;
+        self.state.rebuffering_percent = percent;
+        unsafe {
+            let should_show = is_buffering && self.state.stream_buffering.is_none();
+            let cmd = if should_show { SW_SHOWNOACTIVATE } else { SW_HIDE };
+            let _ = ShowWindow(self.pill_hwnd, cmd);
+            if should_show {
+                let _ = InvalidateRect(Some(self.pill_hwnd), None, false);
+            }
+            if !self.bar_hwnd.is_invalid() && self.state.bar_visible {
+                let _ = InvalidateRect(Some(self.bar_hwnd), None, false);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Redraw rebuffering indicators when speed/percent updates
+    pub fn update_rebuffering_display(&mut self) {
+        unsafe {
+            if self.state.is_rebuffering && self.state.stream_buffering.is_none() {
+                let _ = InvalidateRect(Some(self.pill_hwnd), None, false);
+            }
+            if !self.bar_hwnd.is_invalid() && self.state.bar_visible {
+                let _ = InvalidateRect(Some(self.bar_hwnd), None, false);
+            }
+        }
+    }
+
+    /// Set initial stream buffering status (centers waiting card and hides direct3d child surface)
+    pub fn set_stream_buffering(&mut self, buf: Option<BufferingStatus>) {
+        let is_some = buf.is_some();
+        self.state.stream_buffering = buf;
+        if is_some {
+            self.set_video_visible(false);
+            unsafe {
+                let _ = ShowWindow(self.pill_hwnd, SW_HIDE);
+            }
+        } else {
+            self.set_video_visible(true);
+            if self.state.is_rebuffering {
+                unsafe {
+                    let _ = ShowWindow(self.pill_hwnd, SW_SHOWNOACTIVATE);
+                    let _ = InvalidateRect(Some(self.pill_hwnd), None, false);
+                }
+            }
+        }
+        self.request_redraw();
     }
 
     pub fn handle_bar_mouse_move(&mut self, px: i32, py: i32) {
@@ -705,6 +870,14 @@ impl VesperUi {
                         .unwrap_or("Torrent")
                         .to_string();
                     if cfg!(feature = "torrent") {
+                        self.set_stream_buffering(Some(BufferingStatus {
+                            title: filename.clone(),
+                            stage: "Fetching torrent metadata...".to_string(),
+                            buffered_bytes: 0,
+                            total_bytes: 0,
+                            speed_bytes: 0,
+                            peers: 0,
+                        }));
                         self.state.torrent_status_text =
                             "Fetching torrent file list...".to_string();
                         self.state.status_message = Some((
@@ -900,6 +1073,9 @@ impl VesperUi {
                 duration,
                 path,
             } => {
+                if path.is_some() {
+                    self.set_stream_buffering(None);
+                }
                 self.state.media_title = title.clone();
                 self.state.duration = *duration;
                 self.state.current_path = path.clone();
@@ -914,6 +1090,9 @@ impl VesperUi {
 
             AppEvent::TimePosChanged(pos) => {
                 self.state.time_pos = *pos;
+                if *pos > 0.0 && self.state.stream_buffering.is_some() {
+                    self.set_stream_buffering(None);
+                }
                 // Highlight active cue
                 if !self.state.cues.is_empty() {
                     let mut found = None;
@@ -1043,10 +1222,20 @@ impl VesperUi {
 
             AppEvent::TorrentStatusChanged(status) => {
                 match status {
-                    StreamStatus::Connecting { title: _ }
-                    | StreamStatus::DownloadingMetadata { title: _ } => {
+                    StreamStatus::Connecting { title }
+                    | StreamStatus::DownloadingMetadata { title } => {
                         self.state.torrent_status_text =
                             "Fetching torrent file list...".to_string();
+                        if self.state.stream_buffering.is_none() {
+                            self.set_stream_buffering(Some(BufferingStatus {
+                                title: title.clone(),
+                                stage: "Fetching torrent metadata...".to_string(),
+                                buffered_bytes: 0,
+                                total_bytes: 0,
+                                speed_bytes: 0,
+                                peers: 0,
+                            }));
+                        }
                     }
                     StreamStatus::SelectingBatch { .. } => {
                         self.state.torrent_status_text.clear();
@@ -1061,6 +1250,12 @@ impl VesperUi {
                         self.state.is_torrent_complete = *is_complete;
                         self.state.torrent_status_text =
                             format!("Streaming: {} ({:.1}%)", title, progress_pct);
+                        if let Some(ref mut buf) = self.state.stream_buffering {
+                            buf.title = title.clone();
+                            if buf.speed_bytes > 0 {
+                                buf.stage = "Buffering stream...".to_string();
+                            }
+                        }
                     }
                     StreamStatus::Completed { title, .. } => {
                         self.state.is_streaming_torrent = true;
@@ -1070,9 +1265,11 @@ impl VesperUi {
                     StreamStatus::Idle => {
                         self.state.is_streaming_torrent = false;
                         self.state.is_torrent_complete = false;
+                        self.set_stream_buffering(None);
                     }
                     StreamStatus::Error(e) => {
                         self.state.torrent_status_text = format!("Torrent error: {}", e);
+                        self.set_stream_buffering(None);
                     }
                 }
                 self.request_redraw();
@@ -1154,8 +1351,25 @@ impl VesperUi {
                 self.request_redraw();
             }
 
+            AppEvent::PlaybackRestart => {
+                if self.state.stream_buffering.is_some() {
+                    self.set_stream_buffering(None);
+                }
+                if self.state.is_rebuffering {
+                    self.set_rebuffering(false, 0);
+                }
+            }
+
+            AppEvent::CacheBuffering {
+                is_buffering,
+                percent,
+            } => {
+                self.set_rebuffering(*is_buffering, *percent);
+            }
+
             AppEvent::StatusMessage(msg) => {
                 if msg.starts_with("Playback error") {
+                    self.set_stream_buffering(None);
                     self.set_video_visible(false);
                 }
                 self.state.status_message = Some((msg.clone(), Instant::now()));
@@ -1707,7 +1921,16 @@ impl VesperUi {
                         if modal.mode == BatchMode::Stream {
                             let torrent_id = modal.torrent_id;
                             let file_idx = file.index;
+                            let file_title = file.path.clone();
                             self.state.batch_modal = None;
+                            self.set_stream_buffering(Some(BufferingStatus {
+                                title: file_title,
+                                stage: "Buffering stream...".to_string(),
+                                buffered_bytes: 0,
+                                total_bytes: 0,
+                                speed_bytes: 0,
+                                peers: 0,
+                            }));
                             self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
                                 id: torrent_id,
                                 file_idx,
@@ -2036,6 +2259,14 @@ impl VesperUi {
                                 if let Some(ref torrent_info) = ep.torrent_info {
                                     // Batch torrent stream episode
                                     let (t_id, f_idx) = *torrent_info;
+                                    self.set_stream_buffering(Some(BufferingStatus {
+                                        title: ep.clean_title.clone(),
+                                        stage: "Buffering stream...".to_string(),
+                                        buffered_bytes: 0,
+                                        total_bytes: 0,
+                                        speed_bytes: 0,
+                                        peers: 0,
+                                    }));
                                     self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
                                         id: t_id,
                                         file_idx: f_idx,
@@ -2208,22 +2439,10 @@ impl VesperUi {
                                             });
                                             return true;
                                         } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
-                                            self.state.torrent_status_text =
-                                                "Fetching torrent file list...".to_string();
-                                            self.state.status_message = Some((
-                                                "Fetching torrent file list...".to_string(),
-                                                Instant::now(),
-                                            ));
                                             self.action_queue
                                                 .push_back(UiAction::StreamNyaa(item.clone()));
                                             return true;
                                         } else {
-                                            self.state.torrent_status_text =
-                                                "Fetching torrent file list...".to_string();
-                                            self.state.status_message = Some((
-                                                "Fetching torrent file list...".to_string(),
-                                                Instant::now(),
-                                            ));
                                             self.action_queue
                                                 .push_back(UiAction::StreamNyaa(item.clone()));
                                             return true;
@@ -2385,9 +2604,16 @@ impl VesperUi {
         if !q.is_empty() {
             // 1. Direct HTTP/HTTPS/HLS stream URL pasted into search/stream box
             if crate::stream::is_direct_stream_url(&q) {
+                self.set_stream_buffering(Some(BufferingStatus {
+                    title: q.clone(),
+                    stage: "Buffering stream...".to_string(),
+                    buffered_bytes: 0,
+                    total_bytes: 0,
+                    speed_bytes: 0,
+                    peers: 0,
+                }));
                 self.action_queue
                     .push_back(UiAction::Player(PlayerCommand::Load(q.clone())));
-                self.set_video_visible(true);
                 self.state.search_focused = false;
                 self.state.current_path = None;
                 self.state.media_title = q.clone();
@@ -2410,6 +2636,14 @@ impl VesperUi {
                 };
 
                 if cfg!(feature = "torrent") {
+                    self.set_stream_buffering(Some(BufferingStatus {
+                        title: title.clone(),
+                        stage: "Fetching torrent metadata...".to_string(),
+                        buffered_bytes: 0,
+                        total_bytes: 0,
+                        speed_bytes: 0,
+                        peers: 0,
+                    }));
                     self.state.torrent_status_text =
                         "Fetching torrent file list...".to_string();
                     self.state.status_message = Some((

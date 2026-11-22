@@ -163,7 +163,8 @@ fn main() -> Result<()> {
             .downloads
             .iter()
             .any(|d| matches!(d.state, TorrentTaskState::Downloading | TorrentTaskState::Resolving));
-        if ui.is_video_playing() || has_active_downloads {
+        let is_buffering = ui.state.stream_buffering.is_some() || ui.state.is_rebuffering;
+        if ui.is_video_playing() || has_active_downloads || is_buffering {
             elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
         } else {
             elwt.set_control_flow(ControlFlow::Wait);
@@ -180,7 +181,7 @@ fn main() -> Result<()> {
                         let _ = event_proxy.send_event(AppEvent::DownloadCompleted(dl.output_path.clone()));
                     }
                 }
-                ui.handle_app_event(&AppEvent::TorrentDownloadsUpdated(downloads));
+                ui.handle_app_event(&AppEvent::TorrentDownloadsUpdated(downloads.clone()));
 
                 if let Some(torrent_id) = active_torrent_id {
                     let status = engine.poll_status(torrent_id);
@@ -189,6 +190,40 @@ fn main() -> Result<()> {
                     if let StreamStatus::Completed { file_path, .. } = status {
                         current_file_path = Some(file_path);
                     }
+                }
+
+                // Update stream buffering stats / stages if waiting card is active
+                if let Some(ref mut buf) = ui.state.stream_buffering {
+                    let current_dl = if let Some(id) = active_torrent_id {
+                        downloads.iter().find(|d| d.id == id)
+                    } else {
+                        downloads.iter().find(|d| d.is_stream)
+                    };
+                    if let Some(dl) = current_dl {
+                        buf.buffered_bytes = dl.downloaded_bytes;
+                        buf.total_bytes = dl.total_bytes;
+                        buf.speed_bytes = dl.speed_bytes;
+                        buf.peers = dl.peer_count;
+                        if dl.total_bytes == 0 || matches!(dl.state, TorrentTaskState::Resolving) {
+                            buf.stage = "Fetching torrent metadata...".to_string();
+                        } else if dl.speed_bytes == 0 && dl.downloaded_bytes == 0 {
+                            buf.stage = "Waiting for peers...".to_string();
+                        } else {
+                            buf.stage = "Buffering stream...".to_string();
+                        }
+                    }
+                    ui.request_redraw();
+                }
+
+                // Update rebuffering speed if mid-playback cache pause is active
+                if ui.state.is_rebuffering {
+                    let speed = if let Some(id) = active_torrent_id {
+                        downloads.iter().find(|d| d.id == id).map(|d| d.speed_bytes).unwrap_or(0)
+                    } else {
+                        downloads.iter().find(|d| d.is_stream).map(|d| d.speed_bytes).unwrap_or(0)
+                    };
+                    ui.state.rebuffering_speed_bytes = speed;
+                    ui.update_rebuffering_display();
                 }
             }
         }
@@ -205,10 +240,17 @@ fn main() -> Result<()> {
                                 match &ev {
                                     AppEvent::TimePosChanged(pos) => {
                                         current_playback_time = *pos;
+                                        if *pos > 0.0 && ui.state.stream_buffering.is_some() {
+                                            ui.set_stream_buffering(None);
+                                        }
                                         // Update active subtitle cue
                                         if let Some(cue) = cue_buffer.get_active_cue(*pos) {
                                             ui.handle_app_event(&AppEvent::SubCueEmitted(cue.clone()));
                                         }
+                                        ui.handle_app_event(&ev);
+                                    }
+                                    AppEvent::PlaybackRestart => {
+                                        ui.set_stream_buffering(None);
                                         ui.handle_app_event(&ev);
                                     }
                                     AppEvent::SubTextChanged(text) => {
@@ -251,7 +293,11 @@ fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     let _ = p.load(&stream_url);
                                 }
-                                ui.set_video_visible(true);
+                                if ui.state.stream_buffering.is_none() {
+                                    if ui.state.stream_buffering.is_none() {
+                                    ui.set_video_visible(true);
+                                }
+                                }
                                 cue_buffer.clear();
                                 ui.handle_app_event(&AppEvent::FileLoaded {
                                     title: title.clone(),
@@ -260,6 +306,16 @@ fn main() -> Result<()> {
                                 });
                             }
                         }
+                        ui.handle_app_event(&app_event);
+                    }
+
+                    AppEvent::PlaybackRestart => {
+                        ui.set_stream_buffering(None);
+                        ui.set_video_visible(true);
+                        ui.handle_app_event(&app_event);
+                    }
+
+                    AppEvent::CacheBuffering { .. } => {
                         ui.handle_app_event(&app_event);
                     }
 
@@ -290,6 +346,7 @@ fn main() -> Result<()> {
                         if let Some(p) = player.as_mut() {
                             let _ = p.load(&path_str);
                         }
+                        ui.set_stream_buffering(None);
                         ui.set_video_visible(true);
                         current_file_path = Some(path.clone());
                         active_torrent_id = None;
@@ -494,7 +551,9 @@ fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     let _ = p.load(&item.link);
                                 }
-                                ui.set_video_visible(true);
+                                if ui.state.stream_buffering.is_none() {
+                                    ui.set_video_visible(true);
+                                }
                                 current_file_path = None;
                                 active_torrent_id = None;
                                 cue_buffer.clear();
@@ -511,6 +570,14 @@ fn main() -> Result<()> {
                                 let proxy = event_proxy.clone();
                                 let title = item.clean_title.clone();
                                 info!("Starting stream for Nyaa torrent: {title}");
+                                ui.set_stream_buffering(Some(crate::types::BufferingStatus {
+                                    title: title.clone(),
+                                    stage: "Fetching torrent metadata...".to_string(),
+                                    buffered_bytes: 0,
+                                    total_bytes: 0,
+                                    speed_bytes: 0,
+                                    peers: 0,
+                                }));
 
                                 runtime.spawn(async move {
                                     let _ = proxy.send_event(AppEvent::TorrentStatusChanged(
@@ -560,6 +627,14 @@ fn main() -> Result<()> {
                         }
 
                         UiAction::StartTorrentStream { source, title } => {
+                            ui.set_stream_buffering(Some(crate::types::BufferingStatus {
+                                title: title.clone(),
+                                stage: "Fetching torrent metadata...".to_string(),
+                                buffered_bytes: 0,
+                                total_bytes: 0,
+                                speed_bytes: 0,
+                                peers: 0,
+                            }));
                             if let Some(engine) = torrent_engine.as_ref() {
                                 let engine = engine.clone();
                                 let proxy = event_proxy.clone();
@@ -695,7 +770,7 @@ fn main() -> Result<()> {
                         }
 
                         UiAction::OpenTorrentFolder(path) => {
-                            let _ = crate::stream::open_folder(&path);
+                            let _ = crate::stream::open_folder(&path, Some(&config.download_dir));
                         }
 
                         UiAction::ChangeDownloadDir => {
@@ -722,6 +797,21 @@ fn main() -> Result<()> {
                         UiAction::SelectBatchTorrentFile { id, file_idx } => {
                             if let Some(engine) = torrent_engine.as_ref() {
                                 let stream_url = engine.get_stream_url(id, file_idx);
+                                let file_title = engine
+                                    .get_torrent_files(id)
+                                    .and_then(|files| files.into_iter().find(|f| f.index == file_idx))
+                                    .map(|f| f.path)
+                                    .unwrap_or_else(|| format!("File #{}", file_idx));
+
+                                ui.set_stream_buffering(Some(crate::types::BufferingStatus {
+                                    title: file_title,
+                                    stage: "Buffering stream...".to_string(),
+                                    buffered_bytes: 0,
+                                    total_bytes: 0,
+                                    speed_bytes: 0,
+                                    peers: 0,
+                                }));
+
                                 let engine_clone = engine.clone();
                                 let proxy = event_proxy.clone();
                                 info!("Selecting batch file #{file_idx} for torrent #{id}");
@@ -770,7 +860,9 @@ fn main() -> Result<()> {
                                 if let Some(p) = player.as_mut() {
                                     let _ = p.load(&stream_url);
                                 }
-                                ui.set_video_visible(true);
+                                if ui.state.stream_buffering.is_none() {
+                                    ui.set_video_visible(true);
+                                }
                                 active_torrent_id = Some(id);
                                 cue_buffer.clear();
                             }

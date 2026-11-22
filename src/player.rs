@@ -14,6 +14,8 @@ const PROP_VOLUME: u64 = 4;
 const PROP_SUB_TEXT: u64 = 5;
 const PROP_CHAPTER_LIST: u64 = 6;
 const PROP_TRACK_LIST: u64 = 7;
+const PROP_PAUSED_FOR_CACHE: u64 = 8;
+const PROP_CACHE_BUFFERING_STATE: u64 = 9;
 
 /// High-performance libmpv player wrapper embedded inside Win32 native window.
 pub struct Player {
@@ -90,9 +92,14 @@ impl Player {
             .context("Failed to observe chapter-list property")?;
         mpv.observe_property("track-list", libmpv2::Format::String, PROP_TRACK_LIST)
             .context("Failed to observe track-list property")?;
+        mpv.observe_property("paused-for-cache", libmpv2::Format::Flag, PROP_PAUSED_FOR_CACHE)
+            .context("Failed to observe paused-for-cache property")?;
+        mpv.observe_property("cache-buffering-state", libmpv2::Format::Int64, PROP_CACHE_BUFFERING_STATE)
+            .context("Failed to observe cache-buffering-state property")?;
 
-        // Ensure FileLoaded and PropertyChange events are enabled
+        // Ensure FileLoaded, PlaybackRestart, and PropertyChange events are enabled
         let _ = mpv.enable_event(libmpv2::events::mpv_event_id::FileLoaded);
+        let _ = mpv.enable_event(libmpv2::events::mpv_event_id::PlaybackRestart);
         let _ = mpv.enable_event(libmpv2::events::mpv_event_id::PropertyChange);
 
         Ok(Self {
@@ -380,8 +387,23 @@ impl Player {
                                 let chapters = self.get_chapters();
                                 out_events.push(AppEvent::ChaptersLoaded(chapters));
                             }
+                            "paused-for-cache" => {
+                                if let libmpv2::events::PropertyData::Flag(is_buffering) = change {
+                                    let percent = self.mpv.get_property::<i64>("cache-buffering-state").unwrap_or(0);
+                                    out_events.push(AppEvent::CacheBuffering { is_buffering, percent });
+                                }
+                            }
+                            "cache-buffering-state" => {
+                                if let libmpv2::events::PropertyData::Int64(percent) = change {
+                                    let is_buffering = self.mpv.get_property::<bool>("paused-for-cache").unwrap_or(false);
+                                    out_events.push(AppEvent::CacheBuffering { is_buffering, percent });
+                                }
+                            }
                             _ => {}
                         }
+                    }
+                    libmpv2::events::Event::PlaybackRestart => {
+                        out_events.push(AppEvent::PlaybackRestart);
                     }
                     libmpv2::events::Event::EndFile(reason) => {
                         if reason == libmpv2::mpv_end_file_reason::Error {

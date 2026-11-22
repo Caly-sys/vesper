@@ -177,6 +177,17 @@ pub enum StreamStatus {
     Error(String),
 }
 
+/// Initial stream buffering status for the center waiting card
+#[derive(Debug, Clone, PartialEq)]
+pub struct BufferingStatus {
+    pub title: String,
+    pub stage: String,
+    pub buffered_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bytes: u64,
+    pub peers: usize,
+}
+
 /// Command sent to controlling the MPV player instance
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerCommand {
@@ -227,6 +238,13 @@ pub enum AppEvent {
     NyaaSearchError(String),
     /// Stream status update
     TorrentStatusChanged(StreamStatus),
+    /// MPV playback restarted or resumed
+    PlaybackRestart,
+    /// Mid-playback cache rebuffering state changed
+    CacheBuffering {
+        is_buffering: bool,
+        percent: i64,
+    },
     /// Active / completed torrent downloads list updated
     TorrentDownloadsUpdated(Vec<TorrentDownloadItem>),
     /// Download reached 100% completion

@@ -7,7 +7,7 @@ use windows::Win32::Graphics::Gdi::*;
 
 use crate::stream::{is_direct_stream_url, is_magnet, is_torrent_url};
 use crate::types::{
-    AudioTrack, BatchMode, ChapterInfo, EpisodeEntry, NyaaCategory, NyaaItem, SubCue, SubTrack,
+    AudioTrack, BatchMode, BufferingStatus, ChapterInfo, EpisodeEntry, NyaaCategory, NyaaItem, SubCue, SubTrack,
     TorrentDownloadItem, TorrentFileInfo, TorrentTaskState,
 };
 use crate::ui::layout::{LayoutGeometry, Rect};
@@ -142,6 +142,12 @@ pub struct UiState {
     pub status_message: Option<(String, Instant)>,
     pub last_mouse_activity: Instant,
     pub bar_visible: bool,
+
+    // Buffering & overlay states
+    pub stream_buffering: Option<BufferingStatus>,
+    pub is_rebuffering: bool,
+    pub rebuffering_percent: i64,
+    pub rebuffering_speed_bytes: u64,
 }
 
 impl Default for UiState {
@@ -203,6 +209,11 @@ impl Default for UiState {
             status_message: None,
             last_mouse_activity: Instant::now(),
             bar_visible: true,
+
+            stream_buffering: None,
+            is_rebuffering: false,
+            rebuffering_percent: 0,
+            rebuffering_speed_bytes: 0,
         }
     }
 }
@@ -290,6 +301,169 @@ pub fn format_time(seconds: f64) -> String {
     }
 }
 
+pub fn render_stream_buffering_card(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    _state: &UiState,
+    buf: &BufferingStatus,
+    fonts: &ThemeFonts,
+) {
+    let card_w = 420.min(geom.video_rect.w - 40).max(280);
+    let card_h = 136;
+    let cx = geom.video_rect.x + (geom.video_rect.w - card_w) / 2;
+    let cy = geom.video_rect.y + (geom.video_rect.h - card_h) / 2;
+
+    // Card background & 1px border
+    draw_rounded_rect(
+        hdc,
+        cx,
+        cy,
+        card_w,
+        card_h,
+        10,
+        COLOR_SURFACE,
+        Some(COLOR_BORDER),
+    );
+
+    // Headline stage
+    draw_text(
+        hdc,
+        &buf.stage,
+        cx + 20,
+        cy + 18,
+        card_w - 40,
+        22,
+        fonts.heading,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Subtitle title
+    draw_text(
+        hdc,
+        &buf.title,
+        cx + 20,
+        cy + 44,
+        card_w - 40,
+        18,
+        fonts.small,
+        COLOR_TEXT_SECONDARY,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Progress / shimmer bar (3px height)
+    let bar_x = cx + 20;
+    let bar_y = cy + 74;
+    let bar_w = card_w - 40;
+    let bar_h = 3;
+
+    fill_rect(hdc, bar_x, bar_y, bar_w, bar_h, COLOR_SEEK_TRACK);
+
+    if buf.total_bytes > 0 {
+        let pct = (buf.buffered_bytes as f64 / buf.total_bytes as f64).clamp(0.02, 1.0);
+        let filled_w = ((bar_w as f64) * pct).round() as i32;
+        fill_rect(hdc, bar_x, bar_y, filled_w.max(4), bar_h, COLOR_ACCENT);
+    } else {
+        // Animated shimmer segment
+        let shimmer_w = (bar_w / 4).max(30);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let travel = (bar_w + shimmer_w) as u128;
+        let offset = ((now_ms / 15) % travel) as i32 - shimmer_w;
+        let sx = (bar_x + offset).max(bar_x);
+        let ex = (bar_x + offset + shimmer_w).min(bar_x + bar_w);
+        if ex > sx {
+            fill_rect(hdc, sx, bar_y, ex - sx, bar_h, COLOR_ACCENT);
+        }
+    }
+
+    // Live stats line
+    let stats_text = if buf.total_bytes > 0 {
+        format!(
+            "{} / {} · {} · {} peers",
+            format_bytes(buf.buffered_bytes),
+            format_bytes(buf.total_bytes),
+            format_speed(buf.speed_bytes),
+            buf.peers
+        )
+    } else if buf.speed_bytes > 0 || buf.peers > 0 {
+        format!("{} · {} peers", format_speed(buf.speed_bytes), buf.peers)
+    } else {
+        "Connecting to peers...".to_string()
+    };
+
+    draw_text(
+        hdc,
+        &stats_text,
+        cx + 20,
+        cy + 88,
+        card_w - 40,
+        20,
+        fonts.small,
+        COLOR_TEXT_MUTED,
+        DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+}
+
+pub fn render_rebuffering_pill(
+    hdc: HDC,
+    w: i32,
+    h: i32,
+    state: &UiState,
+    fonts: &ThemeFonts,
+) {
+    // Background & border
+    draw_rounded_rect(
+        hdc,
+        0,
+        0,
+        w,
+        h,
+        8,
+        COLOR_SURFACE,
+        Some(COLOR_BORDER),
+    );
+
+    // Accent line at bottom (2px height)
+    fill_rect(hdc, 12, h - 3, w - 24, 2, COLOR_SEEK_TRACK);
+    let pct = if state.rebuffering_percent > 0 {
+        (state.rebuffering_percent as f64 / 100.0).clamp(0.05, 1.0)
+    } else {
+        0.5
+    };
+    let fill_w = (((w - 24) as f64) * pct).round() as i32;
+    fill_rect(hdc, 12, h - 3, fill_w.max(6), 2, COLOR_ACCENT);
+
+    // Text: e.g. "Buffering 64% · 2.4 MB/s" or "Buffering..."
+    let text = if state.rebuffering_percent > 0 && state.rebuffering_speed_bytes > 0 {
+        format!(
+            "Buffering {}% · {}",
+            state.rebuffering_percent,
+            format_speed(state.rebuffering_speed_bytes)
+        )
+    } else if state.rebuffering_percent > 0 {
+        format!("Buffering {}%", state.rebuffering_percent)
+    } else if state.rebuffering_speed_bytes > 0 {
+        format!("Buffering · {}", format_speed(state.rebuffering_speed_bytes))
+    } else {
+        "Buffering...".to_string()
+    };
+
+    draw_text(
+        hdc,
+        &text,
+        0,
+        0,
+        w,
+        h - 3,
+        fonts.small_bold,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
 pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
     // 1. Draw theater video backdrop (deep viewport black #0E0E11)
     fill_rect(
@@ -301,8 +475,10 @@ pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &Theme
         COLOR_VIEWPORT_BG,
     );
 
-    // If no media is loaded, render clean dark dropzone empty state inside video area
-    if state.current_path.is_none() && state.duration <= 0.0 {
+    // If stream is buffering, render stream buffering card
+    if let Some(ref buf) = state.stream_buffering {
+        render_stream_buffering_card(hdc, geom, state, buf, fonts);
+    } else if state.current_path.is_none() && state.duration <= 0.0 {
         let dz = &geom.empty_dropzone_rect;
         if dz.w > 160 && dz.h > 120 {
             // Dropzone card
@@ -595,11 +771,14 @@ pub fn render_bottom_bar(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
     } else {
-        let time_str = format!(
+        let mut time_str = format!(
             "{} / {}",
             format_time(state.time_pos),
             format_time(state.duration)
         );
+        if state.is_rebuffering {
+            time_str.push_str(" · Buffering...");
+        }
         draw_text(
             hdc,
             &time_str,
