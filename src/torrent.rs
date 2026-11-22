@@ -29,6 +29,7 @@ pub struct ManagedTaskInfo {
     pub is_stream: bool,
     pub dest_dir: PathBuf,
     pub info_hash: Option<String>,
+    pub selected_file_indices: HashSet<usize>,
 }
 
 pub fn is_video_extension(ext: &str) -> bool {
@@ -154,6 +155,7 @@ impl TorrentEngine {
                             is_stream: false,
                             dest_dir: output_folder,
                             info_hash: Some(handle.info_hash().as_string()),
+                            selected_file_indices: HashSet::new(),
                         },
                     );
                 }
@@ -371,6 +373,7 @@ impl TorrentEngine {
                                     is_stream: true,
                                     dest_dir: self.cache_dir.clone(),
                                     info_hash: Some(handle.info_hash().as_string()),
+                                    selected_file_indices: HashSet::new(),
                                 },
                             );
                         }
@@ -437,6 +440,7 @@ impl TorrentEngine {
                                 is_stream: true,
                                 dest_dir: self.cache_dir.clone(),
                                 info_hash: Some(handle.info_hash().as_string()),
+                                selected_file_indices: [file_idx].into_iter().collect(),
                             },
                         );
                     }
@@ -557,6 +561,7 @@ impl TorrentEngine {
                     is_stream: true,
                     dest_dir: self.cache_dir.clone(),
                     info_hash: Some(handle.info_hash().as_string()),
+                    selected_file_indices: [file_idx].into_iter().collect(),
                 },
             );
         }
@@ -705,6 +710,7 @@ impl TorrentEngine {
                                     is_stream: false,
                                     dest_dir: dest_dir.to_path_buf(),
                                     info_hash: Some(handle.info_hash().as_string()),
+                                    selected_file_indices: HashSet::new(),
                                 },
                             );
                         }
@@ -764,6 +770,7 @@ impl TorrentEngine {
                                 is_stream: false,
                                 dest_dir: dest_dir.to_path_buf(),
                                 info_hash: Some(handle.info_hash().as_string()),
+                                selected_file_indices: [single_idx].into_iter().collect(),
                             },
                         );
                     }
@@ -861,6 +868,7 @@ impl TorrentEngine {
                     is_stream: false,
                     dest_dir: dest_dir.to_path_buf(),
                     info_hash: Some(handle.info_hash().as_string()),
+                    selected_file_indices: indices.iter().copied().collect(),
                 },
             );
         }
@@ -870,7 +878,22 @@ impl TorrentEngine {
 
     /// Selectively update files to download and unpause for a batch torrent
     pub async fn set_torrent_only_files(&self, id: usize, file_indices: &[usize]) -> Result<(), String> {
-        let only_set: HashSet<usize> = file_indices.iter().copied().collect();
+        let mut only_set: HashSet<usize> = file_indices.iter().copied().collect();
+        if let Some(h) = self.session.get(id.into()) {
+            let stats = h.stats();
+            for (idx, &bytes) in stats.file_progress.iter().enumerate() {
+                if bytes > 0 {
+                    only_set.insert(idx);
+                }
+            }
+        }
+        {
+            let tasks = self.tasks.read();
+            if let Some(t) = tasks.get(&id) {
+                only_set.extend(&t.selected_file_indices);
+            }
+        }
+
         self.api
             .api_torrent_action_update_only_files(id.into(), &only_set)
             .await
@@ -880,6 +903,7 @@ impl TorrentEngine {
             if let Some(m) = h.metadata.load().as_ref() {
                 let mut tasks = self.tasks.write();
                 if let Some(t) = tasks.get_mut(&id) {
+                    t.selected_file_indices.extend(file_indices);
                     if file_indices.len() == 1 {
                         let idx = file_indices[0];
                         t.file_idx = Some(idx);
@@ -899,6 +923,105 @@ impl TorrentEngine {
             }
         }
         Ok(())
+    }
+
+    /// Add next episode to active download set for pre-buffering while preserving existing files
+    pub async fn add_torrent_prebuffer_file(&self, id: usize, next_file_idx: usize) -> Result<(), String> {
+        let mut target_set: HashSet<usize> = HashSet::new();
+        target_set.insert(next_file_idx);
+
+        if let Some(h) = self.session.get(id.into()) {
+            let stats = h.stats();
+            for (idx, &bytes) in stats.file_progress.iter().enumerate() {
+                if bytes > 0 {
+                    target_set.insert(idx);
+                }
+            }
+        }
+
+        {
+            let tasks = self.tasks.read();
+            if let Some(t) = tasks.get(&id) {
+                target_set.extend(&t.selected_file_indices);
+                if let Some(cur) = t.file_idx {
+                    target_set.insert(cur);
+                }
+            }
+        }
+
+        self.api
+            .api_torrent_action_update_only_files(id.into(), &target_set)
+            .await
+            .map_err(|e| format!("Failed to update files for prebuffer torrent #{id}: {e}"))?;
+
+        {
+            let mut tasks = self.tasks.write();
+            if let Some(t) = tasks.get_mut(&id) {
+                t.selected_file_indices.insert(next_file_idx);
+            }
+        }
+
+        let _ = self.api.api_torrent_action_start(id.into()).await;
+        Ok(())
+    }
+
+    /// Check if a specific file inside a torrent has completed and exists on disk
+    pub fn get_file_disk_path_if_complete(&self, id: usize, file_idx: usize) -> Option<PathBuf> {
+        let handle = self.session.get(id.into())?;
+        let metadata_arc = handle.metadata.load();
+        let metadata = metadata_arc.as_ref()?;
+        let fi = metadata.file_infos.get(file_idx)?;
+        let stats = handle.stats();
+        let (is_complete, _) = compute_file_progress(&stats, file_idx, fi.len);
+        if is_complete {
+            let full_path = handle.output_folder().join(&fi.relative_filename);
+            if full_path.exists() {
+                return Some(full_path);
+            }
+        }
+        None
+    }
+
+    /// Return indices of all completed video files and total video file count in torrent
+    pub fn get_completed_video_files(&self, id: usize) -> (Vec<usize>, usize) {
+        let handle = match self.session.get(id.into()) {
+            Some(h) => h,
+            None => return (Vec::new(), 0),
+        };
+        let metadata_arc = handle.metadata.load();
+        let metadata = match metadata_arc.as_ref() {
+            Some(m) => m,
+            None => return (Vec::new(), 0),
+        };
+        let stats = handle.stats();
+        let mut completed = Vec::new();
+        let mut total_videos = 0;
+
+        for (idx, fi) in metadata.file_infos.iter().enumerate() {
+            let is_video = fi
+                .relative_filename
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(is_video_extension)
+                .unwrap_or(false);
+            if is_video {
+                total_videos += 1;
+                let (is_done, _) = compute_file_progress(&stats, idx, fi.len);
+                if is_done {
+                    completed.push(idx);
+                }
+            }
+        }
+        if total_videos == 0 {
+            total_videos = metadata.file_infos.len();
+            for (idx, fi) in metadata.file_infos.iter().enumerate() {
+                let (is_done, _) = compute_file_progress(&stats, idx, fi.len);
+                if is_done {
+                    completed.push(idx);
+                }
+            }
+        }
+        (completed, total_videos)
     }
 
     /// Retrieve all video files in a batch torrent naturally sorted
@@ -1104,6 +1227,34 @@ impl TorrentEngine {
                 handle.output_folder().to_path_buf()
             };
 
+            let (completed_count, total_videos) = if let Some(m) = metadata_arc.as_ref() {
+                let mut v_count = 0;
+                let mut v_done = 0;
+                for (idx, fi) in m.file_infos.iter().enumerate() {
+                    let is_v = fi
+                        .relative_filename
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(is_video_extension)
+                        .unwrap_or(false);
+                    if is_v {
+                        v_count += 1;
+                        let (done, _) = compute_file_progress(&stats, idx, fi.len);
+                        if done {
+                            v_done += 1;
+                        }
+                    }
+                }
+                (v_done, v_count)
+            } else {
+                (0, 0)
+            };
+            let batch_info = if total_videos > 1 {
+                Some((completed_count, total_videos))
+            } else {
+                None
+            };
+
             results.push(TorrentDownloadItem {
                 id,
                 name: task.title,
@@ -1115,6 +1266,7 @@ impl TorrentEngine {
                 state,
                 is_stream: task.is_stream,
                 output_path,
+                batch_info,
             });
         }
 
@@ -1319,6 +1471,26 @@ mod stub {
             _file_indices: &[usize],
         ) -> Result<(), String> {
             Ok(())
+        }
+
+        pub async fn add_torrent_prebuffer_file(
+            &self,
+            _id: usize,
+            _next_file_idx: usize,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub fn get_file_disk_path_if_complete(
+            &self,
+            _id: usize,
+            _file_idx: usize,
+        ) -> Option<PathBuf> {
+            None
+        }
+
+        pub fn get_completed_video_files(&self, _id: usize) -> (Vec<usize>, usize) {
+            (Vec::new(), 0)
         }
 
         pub fn get_torrent_files(

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Gdi::*;
 
 use crate::stream::{is_direct_stream_url, is_magnet, is_torrent_url};
@@ -59,6 +59,8 @@ pub enum HoverControl {
     DownloadPlay(usize),
     DownloadPauseResume(usize),
     DownloadFolder(usize),
+    DownloadEpisodes(usize),
+    DownloadDelete(usize),
     DownloadRemove(usize),
     BatchFile(usize),
     BatchItemWatch(usize),
@@ -154,6 +156,7 @@ pub struct UiState {
     // Download management
     pub download_dir: PathBuf,
     pub downloads: Vec<TorrentDownloadItem>,
+    pub confirming_delete: Option<(usize, Instant)>,
 
     // Batch torrent selection modal
     pub batch_modal: Option<BatchModalState>,
@@ -232,6 +235,7 @@ impl Default for UiState {
 
             download_dir: PathBuf::from(r"Downloads\Vesper"),
             downloads: Vec::new(),
+            confirming_delete: None,
 
             batch_modal: None,
 
@@ -1918,7 +1922,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
     }
     draw_text(
         hdc,
-        "Trusted Only",
+        "Trusted",
         cb.x + box_size + 6,
         cb.y,
         cb.w - box_size - 6,
@@ -2143,12 +2147,26 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
         y += banner_h + 8;
     }
 
-    // 1. Render Downloads Section if any tasks exist
-    if !state.downloads.is_empty() {
+    // 1. Render Downloads Section partitioned into Active and Completed
+    let active: Vec<(usize, &TorrentDownloadItem)> = state
+        .downloads
+        .iter()
+        .enumerate()
+        .filter(|(_, dl)| !matches!(dl.state, TorrentTaskState::Completed))
+        .collect();
+    let completed: Vec<(usize, &TorrentDownloadItem)> = state
+        .downloads
+        .iter()
+        .enumerate()
+        .filter(|(_, dl)| matches!(dl.state, TorrentTaskState::Completed))
+        .collect();
+
+    // Section 1: DOWNLOADING (N)
+    if !active.is_empty() {
         if y + 18 >= list_r.y && y <= list_r.bottom() {
             draw_text(
                 hdc,
-                &format!("DOWNLOADS ({})", state.downloads.len()),
+                &format!("DOWNLOADING ({})", active.len()),
                 list_r.x + 14,
                 y,
                 list_r.w - 28,
@@ -2160,7 +2178,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
         }
         y += 22;
 
-        for (idx, dl) in state.downloads.iter().enumerate() {
+        for &(idx, dl) in &active {
             let card_h = 68;
             if y + card_h >= list_r.y && y <= list_r.bottom() {
                 let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
@@ -2220,7 +2238,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     state_color,
                 );
 
-                // Line 2: Progress bar
+                // Line 2: Progress bar (fill with COLOR_ACCENT)
                 let bar_x = card_r.x + 10;
                 let bar_y = card_r.y + 28;
                 let bar_w = card_r.w - 20;
@@ -2238,11 +2256,6 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                 let pct_clamped = (dl.progress_pct / 100.0).clamp(0.0, 1.0);
                 let fill_w = ((bar_w as f32) * pct_clamped) as i32;
                 if fill_w > 0 {
-                    let fill_color = if matches!(dl.state, TorrentTaskState::Completed) {
-                        COLOR_SUCCESS
-                    } else {
-                        COLOR_ACCENT
-                    };
                     draw_rounded_rect(
                         hdc,
                         bar_x,
@@ -2250,38 +2263,28 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                         fill_w,
                         bar_h,
                         2,
-                        fill_color,
+                        COLOR_ACCENT,
                         None,
                     );
                 }
 
-                // Line 3: Stats text (left) & Action buttons (right)
-                let stats_text = if matches!(dl.state, TorrentTaskState::Completed) {
-                    format!("{} · Completed", format_bytes(dl.total_bytes))
-                } else if matches!(dl.state, TorrentTaskState::Paused) {
-                    format!("{:.1}% · Paused", dl.progress_pct)
-                } else if matches!(dl.state, TorrentTaskState::Resolving) {
-                    "Fetching metadata...".to_string()
-                } else {
-                    format!(
-                        "{}/{} ({:.1}%) · {}/s",
-                        format_bytes(dl.downloaded_bytes),
-                        format_bytes(dl.total_bytes),
-                        dl.progress_pct,
-                        format_speed(dl.speed_bytes),
-                    )
-                };
+                // Line 3: Left stats & Right action buttons
+                let stats_text = format!(
+                    "{}/{} ({:.1}%) · {}/s",
+                    format_bytes(dl.downloaded_bytes),
+                    format_bytes(dl.total_bytes),
+                    dl.progress_pct,
+                    format_speed(dl.speed_bytes),
+                );
 
                 let btn_y = card_r.y + 38;
                 let btn_h = 22;
-                let is_complete = matches!(dl.state, TorrentTaskState::Completed);
 
                 let rem_x = card_r.x + card_r.w - 10 - 24;
-                let fol_x = rem_x - 6 - 48;
-                let act_btn_w = if is_complete { 44 } else { 50 };
-                let act_x = fol_x - 6 - act_btn_w;
+                let fol_x = rem_x - 5 - 46;
+                let pause_x = fol_x - 5 - 46;
 
-                let text_max_w = (act_x - card_r.x - 14).max(0);
+                let text_max_w = (pause_x - card_r.x - 14).max(0);
                 draw_text(
                     hdc,
                     &stats_text,
@@ -2294,39 +2297,27 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
 
-                // Action button (Play / Pause / Resume)
-                let is_act_hover = state.hovered_control
-                    == Some(if is_complete {
-                        HoverControl::DownloadPlay(idx)
-                    } else {
-                        HoverControl::DownloadPauseResume(idx)
-                    });
-                let act_label = if is_complete {
-                    "Play"
-                } else if matches!(dl.state, TorrentTaskState::Paused) {
+                // Pause / Resume button
+                let is_pause_hover =
+                    state.hovered_control == Some(HoverControl::DownloadPauseResume(idx));
+                let pause_label = if matches!(dl.state, TorrentTaskState::Paused) {
                     "Resume"
                 } else {
                     "Pause"
                 };
                 draw_rounded_rect(
                     hdc,
-                    act_x,
+                    pause_x,
                     btn_y,
-                    act_btn_w,
+                    46,
                     btn_h,
                     4,
-                    if is_act_hover {
-                        if is_complete {
-                            COLOR_ACCENT_HOVER
-                        } else {
-                            COLOR_SURFACE_HOVER
-                        }
-                    } else if is_complete {
-                        COLOR_ACCENT
+                    if is_pause_hover {
+                        COLOR_SURFACE_HOVER
                     } else {
                         COLOR_SURFACE
                     },
-                    Some(if is_act_hover {
+                    Some(if is_pause_hover {
                         COLOR_ACCENT
                     } else {
                         COLOR_BORDER
@@ -2334,10 +2325,10 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                 );
                 draw_text(
                     hdc,
-                    act_label,
-                    act_x,
+                    pause_label,
+                    pause_x,
                     btn_y,
-                    act_btn_w,
+                    46,
                     btn_h,
                     fonts.small_bold,
                     COLOR_TEXT_PRIMARY,
@@ -2351,7 +2342,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     hdc,
                     fol_x,
                     btn_y,
-                    48,
+                    46,
                     btn_h,
                     4,
                     if is_fol_hover {
@@ -2370,7 +2361,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     "Folder",
                     fol_x,
                     btn_y,
-                    48,
+                    46,
                     btn_h,
                     fonts.small,
                     if is_fol_hover {
@@ -2381,7 +2372,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );
 
-                // Remove / Cancel button
+                // Remove / Cancel button (×)
                 let is_rem_hover =
                     state.hovered_control == Some(HoverControl::DownloadRemove(idx));
                 draw_rounded_rect(
@@ -2415,6 +2406,290 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     } else {
                         COLOR_TEXT_MUTED
                     },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+            y += card_h + 6;
+        }
+        y += 6;
+    }
+
+    // Section 2: DOWNLOADED (N)
+    if !completed.is_empty() {
+        if y + 18 >= list_r.y && y <= list_r.bottom() {
+            draw_text(
+                hdc,
+                &format!("DOWNLOADED ({})", completed.len()),
+                list_r.x + 14,
+                y,
+                list_r.w - 28,
+                18,
+                fonts.small_bold,
+                COLOR_ACCENT,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        y += 22;
+
+        for &(idx, dl) in &completed {
+            let card_h = 68;
+            if y + card_h >= list_r.y && y <= list_r.bottom() {
+                let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
+                let is_card_hover = state.hovered_control == Some(HoverControl::DownloadCard(idx));
+
+                draw_rounded_rect(
+                    hdc,
+                    card_r.x,
+                    card_r.y,
+                    card_r.w,
+                    card_r.h,
+                    6,
+                    if is_card_hover {
+                        COLOR_SURFACE_HOVER
+                    } else {
+                        COLOR_SURFACE
+                    },
+                    Some(if is_card_hover {
+                        COLOR_ACCENT
+                    } else {
+                        COLOR_BORDER
+                    }),
+                );
+
+                // Line 1: Title (left) & Done badge (right with COLOR_SUCCESS)
+                let badge_w = 70;
+                let card_inner_w = (card_r.w - 20).max(0);
+                let title_w = (card_inner_w - badge_w - 10).max(0);
+                draw_text(
+                    hdc,
+                    &dl.name,
+                    card_r.x + 10,
+                    card_r.y + 6,
+                    title_w,
+                    20,
+                    fonts.bold,
+                    COLOR_TEXT_PRIMARY,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+
+                draw_badge(
+                    hdc,
+                    "Done",
+                    card_r.x + card_r.w - 10 - badge_w,
+                    card_r.y + 6,
+                    fonts.small_bold,
+                    COLOR_BG,
+                    Some(COLOR_SUCCESS),
+                    COLOR_SUCCESS,
+                );
+
+                // Line 2: 100% green bar (COLOR_SUCCESS)
+                let bar_x = card_r.x + 10;
+                let bar_y = card_r.y + 28;
+                let bar_w = card_r.w - 20;
+                let bar_h = 4;
+                draw_rounded_rect(
+                    hdc,
+                    bar_x,
+                    bar_y,
+                    bar_w,
+                    bar_h,
+                    2,
+                    COLOR_SUCCESS,
+                    None,
+                );
+
+                // Line 3: Left stats & Right action buttons
+                let is_batch = dl.batch_info.map(|(_, total)| total > 1).unwrap_or(false);
+                let stats_text = if is_batch {
+                    let (done_eps, total_eps) = dl.batch_info.unwrap();
+                    format!("{} · {}/{} eps", format_bytes(dl.total_bytes), done_eps, total_eps)
+                } else {
+                    format!("{} · Ready", format_bytes(dl.total_bytes))
+                };
+
+                let btn_y = card_r.y + 38;
+                let btn_h = 22;
+
+                let is_confirming = state
+                    .confirming_delete
+                    .map(|(id, t)| id == dl.id && t.elapsed() < Duration::from_secs(3))
+                    .unwrap_or(false);
+                let del_w = if is_confirming { 62 } else { 46 };
+                let del_x = card_r.x + card_r.w - 10 - del_w;
+                let fol_x = del_x - 5 - 46;
+                let files_w = 40;
+                let files_x = fol_x - 5 - files_w;
+                let play_w = 40;
+                let play_x = (if is_batch { files_x } else { fol_x }) - 5 - play_w;
+
+                let text_max_w = (play_x - card_r.x - 14).max(0);
+                draw_text(
+                    hdc,
+                    &stats_text,
+                    card_r.x + 10,
+                    btn_y,
+                    text_max_w,
+                    btn_h,
+                    fonts.small,
+                    COLOR_TEXT_MUTED,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+
+                // Delete button (with two-click safety)
+                let is_del_hover =
+                    state.hovered_control == Some(HoverControl::DownloadDelete(idx));
+                let del_bg = if is_confirming {
+                    COLOR_ERROR
+                } else if is_del_hover {
+                    COLOR_SURFACE_HOVER
+                } else {
+                    COLOR_SURFACE
+                };
+                let del_border = if is_confirming {
+                    COLOR_ERROR
+                } else if is_del_hover {
+                    COLOR_ERROR
+                } else {
+                    COLOR_BORDER
+                };
+                let del_text_color = if is_confirming {
+                    COLOR_TEXT_PRIMARY
+                } else if is_del_hover {
+                    COLOR_ERROR
+                } else {
+                    COLOR_TEXT_SECONDARY
+                };
+                let del_label = if is_confirming { "Confirm?" } else { "Delete" };
+
+                draw_rounded_rect(
+                    hdc,
+                    del_x,
+                    btn_y,
+                    del_w,
+                    btn_h,
+                    4,
+                    del_bg,
+                    Some(del_border),
+                );
+                draw_text(
+                    hdc,
+                    del_label,
+                    del_x,
+                    btn_y,
+                    del_w,
+                    btn_h,
+                    fonts.small_bold,
+                    del_text_color,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Folder button
+                let is_fol_hover =
+                    state.hovered_control == Some(HoverControl::DownloadFolder(idx));
+                draw_rounded_rect(
+                    hdc,
+                    fol_x,
+                    btn_y,
+                    46,
+                    btn_h,
+                    4,
+                    if is_fol_hover {
+                        COLOR_SURFACE_HOVER
+                    } else {
+                        COLOR_SURFACE
+                    },
+                    Some(if is_fol_hover {
+                        COLOR_ACCENT
+                    } else {
+                        COLOR_BORDER
+                    }),
+                );
+                draw_text(
+                    hdc,
+                    "Folder",
+                    fol_x,
+                    btn_y,
+                    46,
+                    btn_h,
+                    fonts.small,
+                    if is_fol_hover {
+                        COLOR_TEXT_PRIMARY
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Files button (batch only)
+                if is_batch {
+                    let is_ep_hover =
+                        state.hovered_control == Some(HoverControl::DownloadEpisodes(idx));
+                    draw_rounded_rect(
+                        hdc,
+                        files_x,
+                        btn_y,
+                        files_w,
+                        btn_h,
+                        4,
+                        if is_ep_hover {
+                            COLOR_SURFACE_HOVER
+                        } else {
+                            COLOR_SURFACE
+                        },
+                        Some(if is_ep_hover {
+                            COLOR_ACCENT
+                        } else {
+                            COLOR_BORDER
+                        }),
+                    );
+                    draw_text(
+                        hdc,
+                        "Files",
+                        files_x,
+                        btn_y,
+                        files_w,
+                        btn_h,
+                        fonts.small,
+                        if is_ep_hover {
+                            COLOR_TEXT_PRIMARY
+                        } else {
+                            COLOR_TEXT_SECONDARY
+                        },
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                }
+
+                // Play button
+                let is_play_hover =
+                    state.hovered_control == Some(HoverControl::DownloadPlay(idx));
+                draw_rounded_rect(
+                    hdc,
+                    play_x,
+                    btn_y,
+                    play_w,
+                    btn_h,
+                    4,
+                    if is_play_hover {
+                        COLOR_ACCENT_HOVER
+                    } else {
+                        COLOR_ACCENT
+                    },
+                    Some(if is_play_hover {
+                        COLOR_ACCENT
+                    } else {
+                        COLOR_BORDER
+                    }),
+                );
+                draw_text(
+                    hdc,
+                    "Play",
+                    play_x,
+                    btn_y,
+                    play_w,
+                    btn_h,
+                    fonts.small_bold,
+                    COLOR_TEXT_PRIMARY,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 );
             }

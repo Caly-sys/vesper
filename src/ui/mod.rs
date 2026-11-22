@@ -7,7 +7,7 @@ pub mod theme;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -87,7 +87,9 @@ pub enum UiAction {
         id: usize,
         delete_files: bool,
     },
+    DeleteTorrent(usize),
     OpenTorrentFolder(PathBuf),
+    OpenBatchPicker(usize),
     ChangeDownloadDir,
     SyncTrackersNow(String),
     SaveTrackers {
@@ -1394,7 +1396,7 @@ impl VesperUi {
                 self.request_redraw();
             }
 
-            AppEvent::OpenFilePath(_) | AppEvent::OpenFolderPath(_) => {}
+            AppEvent::OpenFilePath(_) | AppEvent::OpenFolderPath(_) | AppEvent::FileEnded => {}
 
             AppEvent::MpvWakeup => {
                 self.request_redraw();
@@ -1816,10 +1818,26 @@ impl VesperUi {
                             let mut y =
                                 self.geom.nyaa_results_list.y + 4 - self.state.nyaa_scroll_y;
 
-                            // Downloads section hit test
-                            if !self.state.downloads.is_empty() {
+                            // Downloads section hit test (Active then Completed)
+                            let active: Vec<(usize, &crate::types::TorrentDownloadItem)> = self
+                                .state
+                                .downloads
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, dl)| !matches!(dl.state, crate::types::TorrentTaskState::Completed))
+                                .collect();
+                            let completed: Vec<(usize, &crate::types::TorrentDownloadItem)> = self
+                                .state
+                                .downloads
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, dl)| matches!(dl.state, crate::types::TorrentTaskState::Completed))
+                                .collect();
+
+                            // Section 1: Active downloads hit test
+                            if !active.is_empty() {
                                 y += 22;
-                                for (idx, dl) in self.state.downloads.iter().enumerate() {
+                                for &(idx, _dl) in &active {
                                     let card_h = 68;
                                     let card_r = Rect::new(
                                         self.geom.nyaa_results_list.x + 12,
@@ -1827,31 +1845,67 @@ impl VesperUi {
                                         self.geom.nyaa_results_list.w - 24,
                                         card_h,
                                     );
-                                    if card_r.contains(px, py) {
+                                    if new_hover.is_none() && card_r.contains(px, py) {
                                         let btn_y = card_r.y + 38;
                                         let btn_h = 22;
-                                        let is_complete =
-                                            matches!(dl.state, crate::types::TorrentTaskState::Completed);
-
                                         let rem_x = card_r.x + card_r.w - 10 - 24;
-                                        let fol_x = rem_x - 6 - 48;
-                                        let act_btn_w = if is_complete { 44 } else { 50 };
-                                        let act_x = fol_x - 6 - act_btn_w;
+                                        let fol_x = rem_x - 5 - 46;
+                                        let pause_x = fol_x - 5 - 46;
 
                                         if Rect::new(rem_x, btn_y, 24, btn_h).contains(px, py) {
                                             new_hover = Some(HoverControl::DownloadRemove(idx));
-                                        } else if Rect::new(fol_x, btn_y, 48, btn_h).contains(px, py) {
+                                        } else if Rect::new(fol_x, btn_y, 46, btn_h).contains(px, py) {
                                             new_hover = Some(HoverControl::DownloadFolder(idx));
-                                        } else if Rect::new(act_x, btn_y, act_btn_w, btn_h).contains(px, py) {
-                                            new_hover = Some(if is_complete {
-                                                HoverControl::DownloadPlay(idx)
-                                            } else {
-                                                HoverControl::DownloadPauseResume(idx)
-                                            });
+                                        } else if Rect::new(pause_x, btn_y, 46, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadPauseResume(idx));
                                         } else {
                                             new_hover = Some(HoverControl::DownloadCard(idx));
                                         }
-                                        break;
+                                    }
+                                    y += card_h + 6;
+                                }
+                                y += 6;
+                            }
+
+                            // Section 2: Completed downloads hit test
+                            if !completed.is_empty() {
+                                y += 22;
+                                for &(idx, dl) in &completed {
+                                    let card_h = 68;
+                                    let card_r = Rect::new(
+                                        self.geom.nyaa_results_list.x + 12,
+                                        y,
+                                        self.geom.nyaa_results_list.w - 24,
+                                        card_h,
+                                    );
+                                    if new_hover.is_none() && card_r.contains(px, py) {
+                                        let btn_y = card_r.y + 38;
+                                        let btn_h = 22;
+                                        let is_batch = dl.batch_info.map(|(_, total)| total > 1).unwrap_or(false);
+                                        let is_confirming = self
+                                            .state
+                                            .confirming_delete
+                                            .map(|(id, t)| id == dl.id && t.elapsed() < Duration::from_secs(3))
+                                            .unwrap_or(false);
+                                        let del_w = if is_confirming { 62 } else { 46 };
+                                        let del_x = card_r.x + card_r.w - 10 - del_w;
+                                        let fol_x = del_x - 5 - 46;
+                                        let files_w = 40;
+                                        let files_x = fol_x - 5 - files_w;
+                                        let play_w = 40;
+                                        let play_x = (if is_batch { files_x } else { fol_x }) - 5 - play_w;
+
+                                        if Rect::new(del_x, btn_y, del_w, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadDelete(idx));
+                                        } else if Rect::new(fol_x, btn_y, 46, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadFolder(idx));
+                                        } else if is_batch && Rect::new(files_x, btn_y, files_w, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadEpisodes(idx));
+                                        } else if Rect::new(play_x, btn_y, play_w, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadPlay(idx));
+                                        } else {
+                                            new_hover = Some(HoverControl::DownloadCard(idx));
+                                        }
                                     }
                                     y += card_h + 6;
                                 }
@@ -2574,10 +2628,26 @@ impl VesperUi {
                         let mut y =
                             self.geom.nyaa_results_list.y + 4 - self.state.nyaa_scroll_y;
 
-                        // Downloads section
-                        if !self.state.downloads.is_empty() {
+                        // Downloads section (Active then Completed)
+                        let active: Vec<(usize, &crate::types::TorrentDownloadItem)> = self
+                            .state
+                            .downloads
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, dl)| !matches!(dl.state, crate::types::TorrentTaskState::Completed))
+                            .collect();
+                        let completed: Vec<(usize, &crate::types::TorrentDownloadItem)> = self
+                            .state
+                            .downloads
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, dl)| matches!(dl.state, crate::types::TorrentTaskState::Completed))
+                            .collect();
+
+                        // Section 1: Active downloads click handling
+                        if !active.is_empty() {
                             y += 22;
-                            for (_idx, dl) in self.state.downloads.iter().enumerate() {
+                            for &(_idx, dl) in &active {
                                 let card_h = 68;
                                 let card_r = Rect::new(
                                     self.geom.nyaa_results_list.x + 12,
@@ -2588,13 +2658,9 @@ impl VesperUi {
                                 if card_r.contains(px, py) {
                                     let btn_y = card_r.y + 38;
                                     let btn_h = 22;
-                                    let is_complete =
-                                        matches!(dl.state, crate::types::TorrentTaskState::Completed);
-
                                     let rem_x = card_r.x + card_r.w - 10 - 24;
-                                    let fol_x = rem_x - 6 - 48;
-                                    let act_btn_w = if is_complete { 44 } else { 50 };
-                                    let act_x = fol_x - 6 - act_btn_w;
+                                    let fol_x = rem_x - 5 - 46;
+                                    let pause_x = fol_x - 5 - 46;
 
                                     if Rect::new(rem_x, btn_y, 24, btn_h).contains(px, py) {
                                         self.action_queue.push_back(UiAction::CancelTorrent {
@@ -2602,23 +2668,88 @@ impl VesperUi {
                                             delete_files: false,
                                         });
                                         return true;
-                                    } else if Rect::new(fol_x, btn_y, 48, btn_h).contains(px, py) {
+                                    } else if Rect::new(fol_x, btn_y, 46, btn_h).contains(px, py) {
                                         self.action_queue
                                             .push_back(UiAction::OpenTorrentFolder(dl.output_path.clone()));
                                         return true;
-                                    } else if Rect::new(act_x, btn_y, act_btn_w, btn_h).contains(px, py) {
-                                        if is_complete {
-                                            if dl.output_path.exists() {
-                                                self.action_queue
-                                                    .push_back(UiAction::LoadFile(dl.output_path.clone()));
-                                                self.action_queue.push_back(UiAction::Player(
-                                                    PlayerCommand::Load(dl.output_path.display().to_string()),
-                                                ));
-                                            }
-                                        } else if matches!(dl.state, crate::types::TorrentTaskState::Paused) {
+                                    } else if Rect::new(pause_x, btn_y, 46, btn_h).contains(px, py) {
+                                        if matches!(dl.state, crate::types::TorrentTaskState::Paused) {
                                             self.action_queue.push_back(UiAction::ResumeTorrent(dl.id));
                                         } else {
                                             self.action_queue.push_back(UiAction::PauseTorrent(dl.id));
+                                        }
+                                        return true;
+                                    }
+                                    return true;
+                                }
+                                y += card_h + 6;
+                            }
+                            y += 6;
+                        }
+
+                        // Section 2: Completed downloads click handling
+                        if !completed.is_empty() {
+                            y += 22;
+                            for &(_idx, dl) in &completed {
+                                let card_h = 68;
+                                let card_r = Rect::new(
+                                    self.geom.nyaa_results_list.x + 12,
+                                    y,
+                                    self.geom.nyaa_results_list.w - 24,
+                                    card_h,
+                                );
+                                if card_r.contains(px, py) {
+                                    let btn_y = card_r.y + 38;
+                                    let btn_h = 22;
+                                    let is_batch = dl.batch_info.map(|(_, total)| total > 1).unwrap_or(false);
+                                    let is_confirming = self
+                                        .state
+                                        .confirming_delete
+                                        .map(|(id, t)| id == dl.id && t.elapsed() < Duration::from_secs(3))
+                                        .unwrap_or(false);
+                                    let del_w = if is_confirming { 62 } else { 46 };
+                                    let del_x = card_r.x + card_r.w - 10 - del_w;
+                                    let fol_x = del_x - 5 - 46;
+                                    let files_w = 40;
+                                    let files_x = fol_x - 5 - files_w;
+                                    let play_w = 40;
+                                    let play_x = (if is_batch { files_x } else { fol_x }) - 5 - play_w;
+
+                                    if Rect::new(del_x, btn_y, del_w, btn_h).contains(px, py) {
+                                        if let Some((conf_id, t)) = self.state.confirming_delete {
+                                            if conf_id == dl.id && t.elapsed() < Duration::from_secs(3) {
+                                                self.state.confirming_delete = None;
+                                                self.action_queue.push_back(UiAction::DeleteTorrent(dl.id));
+                                                self.request_redraw();
+                                                return true;
+                                            }
+                                        }
+                                        self.state.confirming_delete = Some((dl.id, Instant::now()));
+                                        self.request_redraw();
+                                        return true;
+                                    } else if Rect::new(fol_x, btn_y, 46, btn_h).contains(px, py) {
+                                        self.action_queue
+                                            .push_back(UiAction::OpenTorrentFolder(dl.output_path.clone()));
+                                        return true;
+                                    } else if is_batch && Rect::new(files_x, btn_y, files_w, btn_h).contains(px, py) {
+                                        self.action_queue.push_back(UiAction::OpenBatchPicker(dl.id));
+                                        return true;
+                                    } else if Rect::new(play_x, btn_y, play_w, btn_h).contains(px, py) {
+                                        if dl.output_path.exists() {
+                                            let target = if dl.output_path.is_dir() {
+                                                crate::episodes::scan_folder_episodes(&dl.output_path)
+                                                    .first()
+                                                    .map(|e| e.path.clone())
+                                            } else {
+                                                Some(dl.output_path.clone())
+                                            };
+                                            if let Some(path) = target {
+                                                self.action_queue
+                                                    .push_back(UiAction::LoadFile(path.clone()));
+                                                self.action_queue.push_back(UiAction::Player(
+                                                    PlayerCommand::Load(path.display().to_string()),
+                                                ));
+                                            }
                                         }
                                         return true;
                                     }
@@ -3018,7 +3149,7 @@ impl VesperUi {
         }
     }
 
-    fn play_next_episode(&mut self) {
+    pub fn play_next_episode(&mut self) {
         if self.state.episodes.is_empty() {
             return;
         }
@@ -3028,15 +3159,31 @@ impl VesperUi {
             None => 0,
         };
 
-        let next_path = self.state.episodes.get(next_idx).map(|ep| ep.path.clone());
-        if let Some(path) = next_path {
+        if let Some(ep) = self.state.episodes.get(next_idx) {
+            let ep_clone = ep.clone();
             self.state.active_ep_idx = Some(next_idx);
-            self.set_video_visible(true);
-            self.action_queue
-                .push_back(UiAction::LoadFile(path.clone()));
-            self.action_queue.push_back(UiAction::Player(
-                PlayerCommand::Load(path.display().to_string()),
-            ));
+            if let Some((t_id, f_idx)) = ep_clone.torrent_info {
+                self.set_stream_buffering(Some(crate::types::BufferingStatus {
+                    title: ep_clone.clean_title.clone(),
+                    stage: "Buffering stream...".to_string(),
+                    buffered_bytes: 0,
+                    total_bytes: 0,
+                    speed_bytes: 0,
+                    peers: 0,
+                }));
+                self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
+                    id: t_id,
+                    file_idx: f_idx,
+                });
+            } else {
+                let path = ep_clone.path;
+                self.set_video_visible(true);
+                self.action_queue
+                    .push_back(UiAction::LoadFile(path.clone()));
+                self.action_queue.push_back(UiAction::Player(
+                    PlayerCommand::Load(path.display().to_string()),
+                ));
+            }
             self.request_redraw();
         }
     }

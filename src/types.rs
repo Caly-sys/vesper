@@ -146,6 +146,7 @@ pub struct TorrentDownloadItem {
     pub state: TorrentTaskState,
     pub is_stream: bool,
     pub output_path: PathBuf,
+    pub batch_info: Option<(usize, usize)>,
 }
 
 /// Detailed file info inside a torrent
@@ -277,4 +278,6 @@ pub enum AppEvent {
     OpenFolderPath(PathBuf),
     /// General status bar or notification message
     StatusMessage(String),
+    /// Playback of current file completed (EOF)
+    FileEnded,
 }

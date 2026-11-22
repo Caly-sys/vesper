@@ -263,7 +263,7 @@ pub async fn search_nyaa(
     debug!("Fetching Nyaa RSS feed: {url}");
 
     let client = reqwest::Client::builder()
-        .user_agent("Vesper/0.1.0")
+        .user_agent(concat!("Vesper/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("Failed to create reqwest HTTP client: {e}"))?;

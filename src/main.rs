@@ -184,6 +184,8 @@ fn main() -> Result<()> {
     let mut current_file_hash: Option<String> = None;
     let mut current_duration: f64 = 0.0;
     let mut active_torrent_id: Option<usize> = None;
+    let mut active_torrent_file_idx: Option<usize> = None;
+    let mut prebuffered_for_current: bool = false;
     let mut completed_torrents: HashSet<usize> = HashSet::new();
     let mut cue_buffer = SubCueBuffer::new();
     let mut is_fullscreen = false;
@@ -239,14 +241,26 @@ fn main() -> Result<()> {
             last_torrent_poll = Instant::now();
             if let Some(engine) = torrent_engine.as_ref() {
                 let mut downloads = engine.poll_all_tasks();
-                for dl in &downloads {
-                    if matches!(dl.state, TorrentTaskState::Completed) && !completed_torrents.contains(&dl.id) {
-                        completed_torrents.insert(dl.id);
+                for dl in &mut downloads {
+                    let (done_files, total_videos) = engine.get_completed_video_files(dl.id);
+                    if !done_files.is_empty() {
                         if let Some(hash) = engine.get_task_info_hash(dl.id) {
-                            vesper_state.record_completed(&hash, &dl.name, dl.output_path.clone(), Vec::new());
+                            vesper_state.record_completed(&hash, &dl.name, dl.output_path.clone(), done_files, total_videos);
                             ui.state.completed_hashes.insert(hash);
                         }
-                        let _ = event_proxy.send_event(AppEvent::DownloadCompleted(dl.output_path.clone()));
+                    }
+                    if matches!(dl.state, TorrentTaskState::Completed) {
+                        if dl.total_bytes == 0 {
+                            let real_size = crate::config::compute_disk_size(&dl.output_path);
+                            dl.total_bytes = real_size;
+                            if dl.downloaded_bytes == 0 {
+                                dl.downloaded_bytes = real_size;
+                            }
+                        }
+                        if !completed_torrents.contains(&dl.id) {
+                            completed_torrents.insert(dl.id);
+                            let _ = event_proxy.send_event(AppEvent::DownloadCompleted(dl.output_path.clone()));
+                        }
                     }
                 }
 
@@ -254,18 +268,49 @@ fn main() -> Result<()> {
                 let known_paths: HashSet<_> = downloads.iter().map(|d| d.output_path.clone()).collect();
                 for (i, (_hash, c)) in vesper_state.completed_torrents.iter().enumerate() {
                     if c.local_path.exists() && !known_paths.contains(&c.local_path) {
+                        let real_size = crate::config::compute_disk_size(&c.local_path);
                         downloads.push(crate::types::TorrentDownloadItem {
                             id: 100_000 + i,
                             name: c.title.clone(),
                             state: TorrentTaskState::Completed,
-                            downloaded_bytes: 0,
-                            total_bytes: 0,
+                            downloaded_bytes: real_size,
+                            total_bytes: real_size,
                             speed_bytes: 0,
                             progress_pct: 100.0,
                             peer_count: 0,
                             output_path: c.local_path.clone(),
                             is_stream: false,
+                            batch_info: if c.is_batch() {
+                                Some((c.file_indices.len(), c.total_video_files))
+                            } else {
+                                None
+                            },
                         });
+                    }
+                }
+
+                // Check auto-prebuffering for next episode in batch if current file is >= 70% duration or 100% complete
+                if !prebuffered_for_current {
+                    if let (Some(t_id), Some(f_idx)) = (active_torrent_id, active_torrent_file_idx) {
+                        let is_70_pct = current_duration > 0.0 && (current_playback_time / current_duration) >= 0.70;
+                        let is_file_100_pct = engine.get_file_disk_path_if_complete(t_id, f_idx).is_some();
+                        if is_70_pct || is_file_100_pct {
+                            if let Some(files) = engine.get_torrent_files(t_id) {
+                                if let Some(pos) = files.iter().position(|f| f.index == f_idx) {
+                                    if pos + 1 < files.len() {
+                                        let next_idx = files[pos + 1].index;
+                                        let engine_clone = engine.clone();
+                                        info!("Auto-prebuffering next episode (file #{next_idx}) for torrent #{t_id}");
+                                        runtime.spawn(async move {
+                                            if let Err(e) = engine_clone.add_torrent_prebuffer_file(t_id, next_idx).await {
+                                                warn!("Failed to prebuffer next file #{next_idx}: {e}");
+                                            }
+                                        });
+                                        prebuffered_for_current = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -330,6 +375,27 @@ fn main() -> Result<()> {
                                         current_playback_time = *pos;
                                         if *pos > 0.0 && ui.state.stream_buffering.is_some() {
                                             ui.set_stream_buffering(None);
+                                        }
+                                        if !prebuffered_for_current {
+                                            if let (Some(t_id), Some(f_idx)) = (active_torrent_id, active_torrent_file_idx) {
+                                                if current_duration > 0.0 && (*pos / current_duration) >= 0.70 {
+                                                    if let Some(engine) = torrent_engine.as_ref() {
+                                                        if let Some(files) = engine.get_torrent_files(t_id) {
+                                                            if let Some(p_idx) = files.iter().position(|f| f.index == f_idx) {
+                                                                if p_idx + 1 < files.len() {
+                                                                    let next_idx = files[p_idx + 1].index;
+                                                                    let engine_clone = engine.clone();
+                                                                    info!("Auto-prebuffering next episode (file #{next_idx}) at 70% duration");
+                                                                    runtime.spawn(async move {
+                                                                        let _ = engine_clone.add_torrent_prebuffer_file(t_id, next_idx).await;
+                                                                    });
+                                                                    prebuffered_for_current = true;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         // Auto-save watch progress every 5 seconds while playing
                                         if last_progress_save.elapsed() >= Duration::from_secs(5) {
@@ -423,6 +489,10 @@ fn main() -> Result<()> {
                                         config.volume = *vol;
                                         ui.handle_app_event(&ev);
                                     }
+                                    AppEvent::FileEnded => {
+                                        info!("Playback reached EOF; advancing to next episode");
+                                        ui.play_next_episode();
+                                    }
                                     _ => {
                                         ui.handle_app_event(&ev);
                                     }
@@ -479,6 +549,11 @@ fn main() -> Result<()> {
                             let _ = config.save();
                         }
                         ui.handle_app_event(&app_event);
+                    }
+
+                    AppEvent::FileEnded => {
+                        info!("Playback reached EOF; advancing to next episode");
+                        ui.play_next_episode();
                     }
 
                     AppEvent::EpisodesLoaded(_)
@@ -742,36 +817,57 @@ fn main() -> Result<()> {
                                 if let Some(completed) = vesper_state.is_downloaded(hash).cloned() {
                                     let local_path = completed.local_path.clone();
                                     if local_path.exists() {
-                                        info!("Found completed download for {hash} at {:?}", local_path);
-                                        if let Some(ref cur) = current_file_path {
-                                            let p_str = cur.display().to_string();
-                                            vesper_state.record_progress(&p_str, current_playback_time, current_duration);
-                                            if let Some(ref h) = current_file_hash {
-                                                vesper_state.record_progress(h, current_playback_time, current_duration);
+                                        let play_target = if local_path.is_dir() {
+                                            let folder_eps = episodes::scan_folder_episodes(&local_path);
+                                            let mut best_ep = None;
+                                            for ep in &folder_eps {
+                                                let p_str = ep.path.display().to_string();
+                                                if let Some(wp) = vesper_state.get_progress(&p_str) {
+                                                    if wp.position_secs >= 10.0 {
+                                                        best_ep = Some(ep.path.clone());
+                                                        break;
+                                                    }
+                                                }
                                             }
+                                            best_ep.or_else(|| folder_eps.first().map(|e| e.path.clone()))
+                                        } else {
+                                            Some(local_path.clone())
+                                        };
+
+                                        if let Some(play_path) = play_target {
+                                            info!("Found completed download for {hash} at {:?}", play_path);
+                                            if let Some(ref cur) = current_file_path {
+                                                let p_str = cur.display().to_string();
+                                                vesper_state.record_progress(&p_str, current_playback_time, current_duration);
+                                                if let Some(ref h) = current_file_hash {
+                                                    vesper_state.record_progress(h, current_playback_time, current_duration);
+                                                }
+                                            }
+                                            let path_str = play_path.display().to_string();
+                                            if let Some(p) = player.as_mut() {
+                                                let _ = p.load(&path_str);
+                                            }
+                                            ui.set_stream_buffering(None);
+                                            ui.set_video_visible(true);
+                                            current_file_path = Some(play_path.clone());
+                                            current_file_hash = Some(hash.clone());
+                                            active_torrent_id = None;
+                                            active_torrent_file_idx = None;
+                                            prebuffered_for_current = false;
+                                            cue_buffer.clear();
+                                            let siblings = episodes::scan_sibling_episodes(&play_path);
+                                            ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
+                                            ui.handle_app_event(&AppEvent::FileLoaded {
+                                                title: completed.title.clone(),
+                                                duration: 0.0,
+                                                path: Some(play_path),
+                                            });
+                                            ui.handle_app_event(&AppEvent::StatusMessage(format!(
+                                                "Playing downloaded copy: {}",
+                                                completed.title
+                                            )));
+                                            continue;
                                         }
-                                        let path_str = local_path.display().to_string();
-                                        if let Some(p) = player.as_mut() {
-                                            let _ = p.load(&path_str);
-                                        }
-                                        ui.set_stream_buffering(None);
-                                        ui.set_video_visible(true);
-                                        current_file_path = Some(local_path.clone());
-                                        current_file_hash = Some(hash.clone());
-                                        active_torrent_id = None;
-                                        cue_buffer.clear();
-                                        let siblings = episodes::scan_sibling_episodes(&local_path);
-                                        ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
-                                        ui.handle_app_event(&AppEvent::FileLoaded {
-                                            title: completed.title.clone(),
-                                            duration: 0.0,
-                                            path: Some(local_path),
-                                        });
-                                        ui.handle_app_event(&AppEvent::StatusMessage(format!(
-                                            "Playing downloaded copy: {}",
-                                            completed.title
-                                        )));
-                                        continue;
                                     }
                                 }
                             }
@@ -886,36 +982,57 @@ fn main() -> Result<()> {
                                 if let Some(completed) = vesper_state.is_downloaded(hash).cloned() {
                                     let local_path = completed.local_path.clone();
                                     if local_path.exists() {
-                                        info!("Found completed download for {hash} at {:?}", local_path);
-                                        if let Some(ref cur) = current_file_path {
-                                            let p_str = cur.display().to_string();
-                                            vesper_state.record_progress(&p_str, current_playback_time, current_duration);
-                                            if let Some(ref h) = current_file_hash {
-                                                vesper_state.record_progress(h, current_playback_time, current_duration);
+                                        let play_target = if local_path.is_dir() {
+                                            let folder_eps = episodes::scan_folder_episodes(&local_path);
+                                            let mut best_ep = None;
+                                            for ep in &folder_eps {
+                                                let p_str = ep.path.display().to_string();
+                                                if let Some(wp) = vesper_state.get_progress(&p_str) {
+                                                    if wp.position_secs >= 10.0 {
+                                                        best_ep = Some(ep.path.clone());
+                                                        break;
+                                                    }
+                                                }
                                             }
+                                            best_ep.or_else(|| folder_eps.first().map(|e| e.path.clone()))
+                                        } else {
+                                            Some(local_path.clone())
+                                        };
+
+                                        if let Some(play_path) = play_target {
+                                            info!("Found completed download for {hash} at {:?}", play_path);
+                                            if let Some(ref cur) = current_file_path {
+                                                let p_str = cur.display().to_string();
+                                                vesper_state.record_progress(&p_str, current_playback_time, current_duration);
+                                                if let Some(ref h) = current_file_hash {
+                                                    vesper_state.record_progress(h, current_playback_time, current_duration);
+                                                }
+                                            }
+                                            let path_str = play_path.display().to_string();
+                                            if let Some(p) = player.as_mut() {
+                                                let _ = p.load(&path_str);
+                                            }
+                                            ui.set_stream_buffering(None);
+                                            ui.set_video_visible(true);
+                                            current_file_path = Some(play_path.clone());
+                                            current_file_hash = Some(hash.clone());
+                                            active_torrent_id = None;
+                                            active_torrent_file_idx = None;
+                                            prebuffered_for_current = false;
+                                            cue_buffer.clear();
+                                            let siblings = episodes::scan_sibling_episodes(&play_path);
+                                            ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
+                                            ui.handle_app_event(&AppEvent::FileLoaded {
+                                                title: completed.title.clone(),
+                                                duration: 0.0,
+                                                path: Some(play_path),
+                                            });
+                                            ui.handle_app_event(&AppEvent::StatusMessage(format!(
+                                                "Playing downloaded copy: {}",
+                                                completed.title
+                                            )));
+                                            continue;
                                         }
-                                        let path_str = local_path.display().to_string();
-                                        if let Some(p) = player.as_mut() {
-                                            let _ = p.load(&path_str);
-                                        }
-                                        ui.set_stream_buffering(None);
-                                        ui.set_video_visible(true);
-                                        current_file_path = Some(local_path.clone());
-                                        current_file_hash = Some(hash.clone());
-                                        active_torrent_id = None;
-                                        cue_buffer.clear();
-                                        let siblings = episodes::scan_sibling_episodes(&local_path);
-                                        ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
-                                        ui.handle_app_event(&AppEvent::FileLoaded {
-                                            title: completed.title.clone(),
-                                            duration: 0.0,
-                                            path: Some(local_path),
-                                        });
-                                        ui.handle_app_event(&AppEvent::StatusMessage(format!(
-                                            "Playing downloaded copy: {}",
-                                            completed.title
-                                        )));
-                                        continue;
                                     }
                                 }
                             }
@@ -978,12 +1095,17 @@ fn main() -> Result<()> {
                             if let Some(ref hash) = info_hash {
                                 if let Some(completed) = vesper_state.is_downloaded(hash) {
                                     if completed.local_path.exists() {
-                                        info!("Already downloaded: {:?} ({hash})", completed.local_path);
-                                        ui.handle_app_event(&AppEvent::StatusMessage(format!(
-                                            "Already downloaded: {}",
-                                            completed.title
-                                        )));
-                                        continue;
+                                        if completed.is_batch() && !completed.is_all_episodes_done() {
+                                            info!("Batch download partially done ({}/{} eps), allowing further download/picker for {hash}",
+                                                completed.file_indices.len(), completed.total_video_files);
+                                        } else {
+                                            info!("Already downloaded: {:?} ({hash})", completed.local_path);
+                                            ui.handle_app_event(&AppEvent::StatusMessage(format!(
+                                                "Already downloaded: {}",
+                                                completed.title
+                                            )));
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -1076,6 +1198,89 @@ fn main() -> Result<()> {
                                 runtime.spawn(async move {
                                     let _ = engine.cancel_torrent(id, delete_files).await;
                                 });
+                            }
+                        }
+
+                        UiAction::DeleteTorrent(id) => {
+                            if let Some(dl) = ui.state.downloads.iter().find(|d| d.id == id).cloned() {
+                                let is_current = current_file_path.as_ref().map_or(false, |cur| {
+                                    cur == &dl.output_path || cur.starts_with(&dl.output_path)
+                                });
+                                if is_current {
+                                    if let Some(p) = player.as_mut() {
+                                        let _ = p.stop();
+                                    }
+                                    ui.set_video_visible(false);
+                                    current_file_path = None;
+                                    active_torrent_id = None;
+                                    active_torrent_file_idx = None;
+                                    prebuffered_for_current = false;
+                                }
+
+                                let freed = crate::config::compute_disk_size(&dl.output_path);
+
+                                if let Some(engine) = torrent_engine.as_ref() {
+                                    let engine = engine.clone();
+                                    runtime.spawn(async move {
+                                        let _ = engine.cancel_torrent(id, true).await;
+                                    });
+                                }
+
+                                if dl.output_path.is_file() {
+                                    let _ = std::fs::remove_file(&dl.output_path);
+                                } else if dl.output_path.is_dir() {
+                                    let _ = std::fs::remove_dir_all(&dl.output_path);
+                                }
+
+                                let engine_hash = torrent_engine.as_ref().and_then(|e| e.get_task_info_hash(id));
+                                let matching_key = vesper_state.completed_torrents.iter().find_map(|(k, c)| {
+                                    if c.local_path == dl.output_path {
+                                        Some(k.clone())
+                                    } else if let Some(ref eh) = engine_hash {
+                                        if k.eq_ignore_ascii_case(eh) {
+                                            Some(k.clone())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                if let Some(ref key) = matching_key {
+                                    vesper_state.remove_completed(key);
+                                    ui.state.completed_hashes.remove(key);
+                                    ui.state.watch_progress_keys.remove(key);
+                                } else if let Some(ref eh) = engine_hash {
+                                    vesper_state.remove_completed(eh);
+                                    ui.state.completed_hashes.remove(eh);
+                                    ui.state.watch_progress_keys.remove(eh);
+                                } else {
+                                    vesper_state.remove_completed(&dl.output_path.to_string_lossy());
+                                }
+                                ui.state.watch_progress_keys.remove(&VesperState::normalize_key(&dl.output_path.to_string_lossy()));
+
+                                completed_torrents.remove(&id);
+                                ui.state.downloads.retain(|d| d.id != id);
+
+                                let contains_deleted = ui.state.episodes.iter().any(|ep| {
+                                    ep.path == dl.output_path || ep.path.starts_with(&dl.output_path)
+                                });
+                                if contains_deleted {
+                                    if let Some(ref cur) = current_file_path {
+                                        let siblings = episodes::scan_sibling_episodes(cur);
+                                        ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
+                                    } else {
+                                        ui.handle_app_event(&AppEvent::EpisodesLoaded(Vec::new()));
+                                        ui.state.active_ep_idx = None;
+                                    }
+                                }
+
+                                ui.handle_app_event(&AppEvent::StatusMessage(format!(
+                                    "Deleted from disk ({} freed)",
+                                    crate::ui::controls::format_bytes(freed)
+                                )));
+                                ui.request_redraw();
                             }
                         }
 
@@ -1173,7 +1378,7 @@ fn main() -> Result<()> {
                                     .unwrap_or_else(|| format!("File #{}", file_idx));
 
                                 ui.set_stream_buffering(Some(crate::types::BufferingStatus {
-                                    title: file_title,
+                                    title: file_title.clone(),
                                     stage: "Buffering stream...".to_string(),
                                     buffered_bytes: 0,
                                     total_bytes: 0,
@@ -1226,14 +1431,80 @@ fn main() -> Result<()> {
                                     ui.state.active_ep_idx = Some(active_idx);
                                 }
 
-                                if let Some(p) = player.as_mut() {
-                                    let _ = p.load(&stream_url);
-                                }
-                                if ui.state.stream_buffering.is_none() {
-                                    ui.set_video_visible(true);
-                                }
                                 active_torrent_id = Some(id);
+                                active_torrent_file_idx = Some(file_idx);
+                                prebuffered_for_current = false;
+
+                                let disk_path_opt = engine.get_file_disk_path_if_complete(id, file_idx);
+                                if let Some(ref disk_path) = disk_path_opt {
+                                    info!("Batch file #{file_idx} is already 100% complete on disk: {:?}", disk_path);
+                                    let path_str = disk_path.display().to_string();
+                                    if let Some(p) = player.as_mut() {
+                                        let _ = p.load(&path_str);
+                                    }
+                                    ui.set_stream_buffering(None);
+                                    ui.set_video_visible(true);
+                                    current_file_path = Some(disk_path.clone());
+                                    ui.handle_app_event(&AppEvent::FileLoaded {
+                                        title: file_title.clone(),
+                                        duration: 0.0,
+                                        path: Some(disk_path.clone()),
+                                    });
+                                } else {
+                                    if let Some(p) = player.as_mut() {
+                                        let _ = p.load(&stream_url);
+                                    }
+                                    if ui.state.stream_buffering.is_none() {
+                                        ui.set_video_visible(true);
+                                    }
+                                }
                                 cue_buffer.clear();
+                            }
+                        }
+
+                        UiAction::OpenBatchPicker(id) => {
+                            let mut resolved_files = None;
+                            let mut resolved_title = format!("Torrent #{id}");
+
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                if let Some(files) = engine.get_torrent_files(id) {
+                                    resolved_files = Some(files);
+                                    if let Some(h) = engine.get_task_info_hash(id) {
+                                        if let Some(c) = vesper_state.is_downloaded(&h) {
+                                            resolved_title = c.title.clone();
+                                        }
+                                    }
+                                }
+                            }
+
+                            if resolved_files.is_none() {
+                                if let Some(dl) = ui.state.downloads.iter().find(|d| d.id == id) {
+                                    resolved_title = dl.name.clone();
+                                    if dl.output_path.is_dir() {
+                                        let ep_list = episodes::scan_folder_episodes(&dl.output_path);
+                                        if !ep_list.is_empty() {
+                                            let files: Vec<crate::types::TorrentFileInfo> = ep_list.into_iter().enumerate().map(|(idx, ep)| {
+                                                let len = std::fs::metadata(&ep.path).map(|m| m.len()).unwrap_or(0);
+                                                crate::types::TorrentFileInfo {
+                                                    index: idx,
+                                                    path: ep.raw_filename,
+                                                    size_bytes: len,
+                                                    is_mkv: true,
+                                                }
+                                            }).collect();
+                                            resolved_files = Some(files);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(files) = resolved_files {
+                                ui.handle_app_event(&AppEvent::BatchTorrentResolved {
+                                    torrent_id: id,
+                                    title: resolved_title,
+                                    mode: BatchMode::Stream,
+                                    files,
+                                });
                             }
                         }
 

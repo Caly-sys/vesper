@@ -18,6 +18,8 @@ libs/libmpv-2.dll
 
 # Local app config & logs
 vesper.toml
+vesper_state.json
+vesper_rqbit_state/
 subs_dump.txt
 *.log
 

@@ -158,10 +158,26 @@ pub fn rqbit_state_dir() -> PathBuf {
 pub struct CompletedTorrent {
     pub title: String,
     pub local_path: PathBuf,
-    #[serde(default)]
+    #[serde(default, rename = "downloaded_file_indices", alias = "file_indices")]
     pub file_indices: Vec<usize>,
     #[serde(default)]
     pub completed_at: u64,
+    #[serde(default)]
+    pub total_video_files: usize,
+}
+
+impl CompletedTorrent {
+    pub fn is_batch(&self) -> bool {
+        self.total_video_files > 1 || self.file_indices.len() > 1
+    }
+
+    pub fn is_all_episodes_done(&self) -> bool {
+        if self.total_video_files <= 1 {
+            true
+        } else {
+            self.file_indices.len() >= self.total_video_files
+        }
+    }
 }
 
 /// Watch position progress marker
@@ -208,21 +224,38 @@ impl VesperState {
         key.trim().to_lowercase().replace('/', "\\")
     }
 
-    pub fn record_completed(&mut self, info_hash: &str, title: &str, local_path: PathBuf, file_indices: Vec<usize>) {
+    pub fn record_completed(
+        &mut self,
+        info_hash: &str,
+        title: &str,
+        local_path: PathBuf,
+        file_indices: Vec<usize>,
+        total_video_files: usize,
+    ) {
         let key = info_hash.trim().to_lowercase();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.completed_torrents.insert(
-            key,
-            CompletedTorrent {
-                title: title.to_string(),
-                local_path,
-                file_indices,
-                completed_at: now,
-            },
-        );
+        let entry = self.completed_torrents.entry(key).or_insert_with(|| CompletedTorrent {
+            title: title.to_string(),
+            local_path: local_path.clone(),
+            file_indices: Vec::new(),
+            completed_at: now,
+            total_video_files,
+        });
+        entry.title = title.to_string();
+        entry.local_path = local_path;
+        entry.completed_at = now;
+        if total_video_files > 0 {
+            entry.total_video_files = total_video_files;
+        }
+        for idx in file_indices {
+            if !entry.file_indices.contains(&idx) {
+                entry.file_indices.push(idx);
+            }
+        }
+        entry.file_indices.sort_unstable();
         let _ = self.save();
     }
 
@@ -249,6 +282,67 @@ impl VesperState {
     pub fn is_downloaded(&self, info_hash: &str) -> Option<&CompletedTorrent> {
         let key = info_hash.trim().to_lowercase();
         self.completed_torrents.get(&key).filter(|c| c.local_path.exists())
+    }
+
+    pub fn remove_completed(&mut self, key_or_path: &str) -> Option<CompletedTorrent> {
+        let norm = Self::normalize_key(key_or_path);
+        let found_key = self.completed_torrents.iter().find_map(|(k, v)| {
+            if Self::normalize_key(k) == norm
+                || Self::normalize_key(&v.local_path.to_string_lossy()) == norm
+                || v.local_path == std::path::Path::new(key_or_path)
+            {
+                Some(k.clone())
+            } else {
+                None
+            }
+        });
+
+        let target_key = found_key.unwrap_or_else(|| key_or_path.trim().to_lowercase());
+        let removed = self.completed_torrents.remove(&target_key);
+
+        let norm_hash = Self::normalize_key(&target_key);
+        let norm_path = removed.as_ref().map(|c| Self::normalize_key(&c.local_path.to_string_lossy()));
+
+        self.watch_progress.retain(|k, _| {
+            if k == &norm || k == &norm_hash {
+                return false;
+            }
+            if let Some(ref p) = norm_path {
+                let norm_prefix = if p.ends_with('\\') {
+                    p.clone()
+                } else {
+                    format!("{p}\\")
+                };
+                if k == p || k.starts_with(&norm_prefix) {
+                    return false;
+                }
+            }
+            true
+        });
+
+        let _ = self.save();
+        removed
+    }
+}
+
+/// Recursively computes the total size in bytes of a file or directory.
+pub fn compute_disk_size(path: &std::path::Path) -> u64 {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if meta.is_file() {
+        meta.len()
+    } else if meta.is_dir() {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total += compute_disk_size(&entry.path());
+            }
+        }
+        total
+    } else {
+        0
     }
 }
 
@@ -352,7 +446,72 @@ mod tests {
             "Episode 1",
             PathBuf::from("C:\\fake_file.mkv"),
             vec![0],
+            12,
         );
-        assert!(state.completed_torrents.contains_key("0123456789abcdef0123456789abcdef01234567"));
+        let ct = state.completed_torrents.get("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(ct.file_indices, vec![0]);
+        assert_eq!(ct.total_video_files, 12);
+        assert!(ct.is_batch());
+        assert!(!ct.is_all_episodes_done());
+
+        state.record_completed(
+            "0123456789abcdef0123456789abcdef01234567",
+            "Episode 1",
+            PathBuf::from("C:\\fake_file.mkv"),
+            vec![1],
+            12,
+        );
+        let ct2 = state.completed_torrents.get("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(ct2.file_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_compute_disk_size_and_remove_completed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "vesper_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file1 = temp_dir.join("test1.bin");
+        let sub = temp_dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file2 = sub.join("test2.bin");
+        std::fs::write(&file1, vec![0u8; 120]).unwrap();
+        std::fs::write(&file2, vec![0u8; 330]).unwrap();
+
+        assert_eq!(compute_disk_size(&file1), 120);
+        assert_eq!(compute_disk_size(&file2), 330);
+        assert_eq!(compute_disk_size(&temp_dir), 450);
+
+        let mut state = VesperState::default();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        state.record_completed(hash, "Show", temp_dir.clone(), vec![0], 2);
+        state.record_progress(hash, 42.0, 100.0);
+        state.record_progress(&file1.to_string_lossy(), 15.0, 100.0);
+
+        assert!(state.completed_torrents.contains_key(hash));
+        assert!(state.get_progress(hash).is_some());
+        assert!(state.get_progress(&file1.to_string_lossy()).is_some());
+
+        let removed = state.remove_completed(hash);
+        assert!(removed.is_some());
+        assert!(!state.completed_torrents.contains_key(hash));
+        assert!(state.get_progress(hash).is_none());
+        assert!(state.get_progress(&file1.to_string_lossy()).is_none());
+
+        state.record_completed(hash, "Show 2", file2.clone(), vec![0], 1);
+        state.record_progress(&file2.to_string_lossy(), 10.0, 50.0);
+        assert!(state.completed_torrents.contains_key(hash));
+        assert!(state.get_progress(&file2.to_string_lossy()).is_some());
+
+        let removed2 = state.remove_completed(&file2.to_string_lossy());
+        assert!(removed2.is_some());
+        assert!(!state.completed_torrents.contains_key(hash));
+        assert!(state.get_progress(&file2.to_string_lossy()).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

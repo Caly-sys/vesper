@@ -195,13 +195,13 @@ impl LayoutGeometry {
         let nyaa_search_w = (nyaa_search_btn.x - drawer_x - 18).max(0);
         let nyaa_search_input = Rect::new(drawer_x + 12, 48, nyaa_search_w, 28);
 
-        let nyaa_trusted_checkbox = Rect::new(drawer_x + 12, 80, 95, 24);
-        let nyaa_category_dropdown = Rect::new(nyaa_trusted_checkbox.right() + 6, 80, 90, 24);
-        let rem_x = nyaa_category_dropdown.right() + 6;
-        let rem_w = (drawer_x + drawer_w - 12 - rem_x).max(80);
-        let btn_w = ((rem_w - 6) / 2).max(35);
-        let stream_download_dir_btn = Rect::new(rem_x, 80, btn_w, 24);
-        let stream_trackers_btn = Rect::new(stream_download_dir_btn.right() + 6, 80, btn_w, 24);
+        let nyaa_trusted_checkbox = Rect::new(drawer_x + 12, 80, 82, 24);
+        let nyaa_category_dropdown = Rect::new(nyaa_trusted_checkbox.right() + 6, 80, 82, 24);
+        let trackers_w = 68;
+        let stream_trackers_btn = Rect::new((drawer_x + drawer_w - 12 - trackers_w).max(drawer_x), 80, trackers_w, 24);
+        let dir_x = nyaa_category_dropdown.right() + 6;
+        let dir_w = (stream_trackers_btn.x - 6 - dir_x).max(35);
+        let stream_download_dir_btn = Rect::new(dir_x, 80, dir_w, 24);
 
         let nyaa_results_list = Rect::new(
             drawer_x,

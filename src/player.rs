@@ -406,7 +406,9 @@ impl Player {
                         out_events.push(AppEvent::PlaybackRestart);
                     }
                     libmpv2::events::Event::EndFile(reason) => {
-                        if reason == libmpv2::mpv_end_file_reason::Error {
+                        if reason == libmpv2::mpv_end_file_reason::Eof {
+                            out_events.push(AppEvent::FileEnded);
+                        } else if reason == libmpv2::mpv_end_file_reason::Error {
                             out_events.push(AppEvent::StatusMessage(
                                 "Playback error: file corrupted or unsupported codec".to_string(),
                             ));
