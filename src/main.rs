@@ -25,7 +25,9 @@ use crate::config::VesperConfig;
 use crate::player::Player;
 use crate::subtitles::{extract_subtitle_track, SubCueBuffer};
 use crate::torrent::TorrentEngine;
-use crate::types::{AppEvent, StreamStatus, TorrentTaskState};
+use crate::types::{
+    AppEvent, BatchMode, EpisodeEntry, StreamStatus, TorrentDownloadAddResult, TorrentTaskState,
+};
 use crate::ui::controls::Tab;
 use crate::ui::{UiAction, VesperUi};
 
@@ -273,6 +275,7 @@ fn main() -> Result<()> {
                     | AppEvent::SubCueEmitted(_)
                     | AppEvent::NyaaResultsLoaded(_)
                     | AppEvent::NyaaSearchError(_)
+                    | AppEvent::BatchTorrentResolved { .. }
                     | AppEvent::TorrentBatchDiscovered { .. }
                     | AppEvent::TorrentDownloadsUpdated(_)
                     | AppEvent::SubtitleExtracted { .. }
@@ -504,6 +507,14 @@ fn main() -> Result<()> {
                                     ));
 
                                     match engine.add_torrent_stream(&link, None).await {
+                                        Ok(StreamStatus::SelectingBatch { id, files }) => {
+                                            let _ = proxy.send_event(AppEvent::BatchTorrentResolved {
+                                                torrent_id: id,
+                                                title: item.clean_title.clone(),
+                                                mode: BatchMode::Stream,
+                                                files,
+                                            });
+                                        }
                                         Ok(status) => {
                                             let _ = proxy.send_event(AppEvent::TorrentStatusChanged(status));
                                         }
@@ -535,6 +546,14 @@ fn main() -> Result<()> {
                                     ));
 
                                     match engine.add_torrent_stream(&source, None).await {
+                                        Ok(StreamStatus::SelectingBatch { id, files }) => {
+                                            let _ = proxy.send_event(AppEvent::BatchTorrentResolved {
+                                                torrent_id: id,
+                                                title: title.clone(),
+                                                mode: BatchMode::Stream,
+                                                files,
+                                            });
+                                        }
                                         Ok(status) => {
                                             let _ = proxy.send_event(AppEvent::TorrentStatusChanged(status));
                                         }
@@ -563,7 +582,15 @@ fn main() -> Result<()> {
 
                                 runtime.spawn(async move {
                                     match engine.add_torrent_download(&source, &dest, None).await {
-                                        Ok(id) => {
+                                        Ok(TorrentDownloadAddResult::Batch { id, title: batch_title, files }) => {
+                                            let _ = proxy.send_event(AppEvent::BatchTorrentResolved {
+                                                torrent_id: id,
+                                                title: batch_title,
+                                                mode: BatchMode::Download,
+                                                files,
+                                            });
+                                        }
+                                        Ok(TorrentDownloadAddResult::Started(id)) => {
                                             info!("Torrent download #{id} queued for '{title}'");
                                             let _ = proxy.send_event(AppEvent::StatusMessage(format!(
                                                 "Downloading '{title}'..."
@@ -645,8 +672,10 @@ fn main() -> Result<()> {
                                 info!("Selecting batch file #{file_idx} for torrent #{id}");
 
                                 runtime.spawn(async move {
-                                    let status = engine_clone.poll_status(id);
+                                    let _ = engine_clone.set_torrent_only_files(id, &[file_idx]).await;
+                                    let _ = engine_clone.resume_torrent(id).await;
 
+                                    let status = engine_clone.poll_status(id);
                                     let _ = proxy.send_event(AppEvent::TorrentStatusChanged(status));
                                     let _ = proxy.send_event(AppEvent::StatusMessage(format!(
                                         "Streaming file #{file_idx} from torrent #{id}"
@@ -659,12 +688,54 @@ fn main() -> Result<()> {
                                     });
                                 });
 
+                                // Populate playlist sidebar tab with all files in batch
+                                if let Some(all_batch_files) = engine.get_torrent_files(id) {
+                                    let mut batch_episodes = Vec::new();
+                                    let mut active_idx = 0;
+                                    for (i, f) in all_batch_files.iter().enumerate() {
+                                        let ep_url = engine.get_stream_url(id, f.index);
+                                        let clean = episodes::clean_nyaa_title(&f.path);
+                                        let num = episodes::parse_episode_number(&clean)
+                                            .or_else(|| episodes::parse_episode_number(&f.path));
+                                        if f.index == file_idx {
+                                            active_idx = i;
+                                        }
+                                        batch_episodes.push(EpisodeEntry {
+                                            path: PathBuf::from(&ep_url),
+                                            raw_filename: f.path.clone(),
+                                            clean_title: clean,
+                                            episode_number: num,
+                                            torrent_info: Some((id, f.index)),
+                                        });
+                                    }
+                                    ui.handle_app_event(&AppEvent::EpisodesLoaded(batch_episodes));
+                                    ui.state.active_ep_idx = Some(active_idx);
+                                }
+
                                 if let Some(p) = player.as_mut() {
                                     let _ = p.load(&stream_url);
                                 }
                                 ui.set_video_visible(true);
                                 active_torrent_id = Some(id);
                                 cue_buffer.clear();
+                            }
+                        }
+
+                        UiAction::StartBatchDownload { id, file_indices } => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine_clone = engine.clone();
+                                let proxy = event_proxy.clone();
+                                let count = file_indices.len();
+                                info!("Starting batch download for torrent #{id} with {count} files");
+                                runtime.spawn(async move {
+                                    if let Err(e) = engine_clone.set_torrent_only_files(id, &file_indices).await {
+                                        error!("Failed to set batch download files: {e}");
+                                    }
+                                    let _ = engine_clone.resume_torrent(id).await;
+                                    let _ = proxy.send_event(AppEvent::StatusMessage(format!(
+                                        "Downloading {count} selected episodes..."
+                                    )));
+                                });
                             }
                         }
 

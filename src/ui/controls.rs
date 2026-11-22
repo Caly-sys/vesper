@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use windows::Win32::Graphics::Gdi::*;
 
 use crate::stream::{is_direct_stream_url, is_magnet, is_torrent_url};
 use crate::types::{
-    AudioTrack, ChapterInfo, EpisodeEntry, NyaaCategory, NyaaItem, SubCue, SubTrack,
+    AudioTrack, BatchMode, ChapterInfo, EpisodeEntry, NyaaCategory, NyaaItem, SubCue, SubTrack,
     TorrentDownloadItem, TorrentFileInfo, TorrentTaskState,
 };
 use crate::ui::layout::{LayoutGeometry, Rect};
@@ -60,8 +61,21 @@ pub enum HoverControl {
     DownloadFolder(usize),
     DownloadRemove(usize),
     BatchFile(usize),
+    BatchItemWatch(usize),
+    BatchSelectAll,
+    BatchClearAll,
     BatchConfirm,
     BatchCancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchModalState {
+    pub torrent_id: usize,
+    pub title: String,
+    pub mode: BatchMode,
+    pub files: Vec<TorrentFileInfo>,
+    pub selected_indices: HashSet<usize>,
+    pub scroll_y: i32,
 }
 
 pub struct UiState {
@@ -117,7 +131,7 @@ pub struct UiState {
     pub downloads: Vec<TorrentDownloadItem>,
 
     // Batch torrent selection modal
-    pub batch_modal: Option<(usize, Vec<TorrentFileInfo>, usize)>,
+    pub batch_modal: Option<BatchModalState>,
 
     // Interaction
     pub hovered_control: Option<HoverControl>,
@@ -434,8 +448,8 @@ pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &Theme
     }
 
     // 5. Render modal dialog if open (e.g. batch torrent selection)
-    if let Some((_, ref files, selected_idx)) = state.batch_modal {
-        render_batch_modal(hdc, geom, files, selected_idx, fonts, state);
+    if let Some(ref modal) = state.batch_modal {
+        render_batch_modal(hdc, geom, modal, fonts, state);
     }
 
     // 6. Render active tooltip
@@ -1461,7 +1475,7 @@ fn render_tab_episodes(
         );
         draw_text(
             hdc,
-            "📁 Choose Folder",
+            "Choose Folder",
             ep_btn.x,
             ep_btn.y,
             ep_btn.w,
@@ -2443,17 +2457,19 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
 fn render_batch_modal(
     hdc: HDC,
     geom: &LayoutGeometry,
-    files: &[TorrentFileInfo],
-    selected_idx: usize,
+    modal: &BatchModalState,
     fonts: &ThemeFonts,
     state: &UiState,
 ) {
-    let modal_w = 480.min(geom.total_width - 40);
-    let modal_h = 360.min(geom.total_height - 60);
+    let modal_w = 560.min(geom.total_width - 40);
+    let modal_h = 440.min(geom.total_height - 60);
     let modal_x = (geom.total_width - modal_w) / 2;
     let modal_y = (geom.total_height - modal_h) / 2;
 
-    // Semi-translucent dark background
+    // Dark dimming backdrop over main client area
+    fill_rect(hdc, 0, 0, geom.total_width, geom.total_height, COLOR_VIEWPORT_BG);
+
+    // Modal container (#141418 surface, #2A2A34 border)
     draw_rounded_rect(
         hdc,
         modal_x,
@@ -2462,141 +2478,466 @@ fn render_batch_modal(
         modal_h,
         8,
         COLOR_SURFACE,
-        Some(COLOR_ACCENT),
+        Some(COLOR_BORDER),
     );
 
-    // Header
+    // Header close button (26x24)
+    let close_btn_w = 26;
+    let close_btn_h = 24;
+    let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+    let close_btn_y = modal_y + 12;
+    let is_close_hover = state.hovered_control == Some(HoverControl::BatchCancel);
+    draw_rounded_rect(
+        hdc,
+        close_btn_x,
+        close_btn_y,
+        close_btn_w,
+        close_btn_h,
+        4,
+        if is_close_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_close_hover { COLOR_ERROR } else { COLOR_BORDER }),
+    );
     draw_text(
         hdc,
-        "Batch Torrent — Select Episode to Play",
-        modal_x + 16,
-        modal_y + 12,
-        modal_w - 32,
-        24,
-        fonts.heading,
-        COLOR_TEXT_PRIMARY,
-        DT_LEFT | DT_SINGLELINE,
+        "×",
+        close_btn_x,
+        close_btn_y - 1,
+        close_btn_w,
+        close_btn_h,
+        fonts.bold,
+        if is_close_hover { COLOR_ERROR } else { COLOR_TEXT_MUTED },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
 
-    // File list
-    let list_y = modal_y + 44;
-    let _list_h = modal_h - 96;
-    let item_h = 36;
+    // Mode badge
+    let (badge_text, badge_color) = if modal.mode == BatchMode::Stream {
+        ("WATCH BATCH", COLOR_ACCENT)
+    } else {
+        ("DOWNLOAD BATCH", COLOR_SUCCESS)
+    };
+    let bw = draw_badge(
+        hdc,
+        badge_text,
+        modal_x + 16,
+        modal_y + 14,
+        fonts.small_bold,
+        COLOR_BG,
+        Some(badge_color),
+        badge_color,
+    );
 
-    for (idx, file) in files.iter().enumerate().take(8) {
-        let row_y = list_y + (idx as i32) * item_h;
-        let is_sel = selected_idx == idx;
-        let is_hover = state.hovered_control == Some(HoverControl::BatchFile(idx));
+    // Release title
+    let title_x = modal_x + 22 + bw;
+    let title_max_w = (close_btn_x - title_x - 12).max(0);
+    draw_text(
+        hdc,
+        &modal.title,
+        title_x,
+        modal_y + 12,
+        title_max_w,
+        24,
+        fonts.bold,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
 
-        let bg = if is_sel {
-            COLOR_CARD_ACTIVE
-        } else if is_hover {
-            COLOR_SURFACE_HOVER
-        } else {
-            COLOR_BG
-        };
-
-        draw_rounded_rect(
+    // Subheader row
+    let sub_y = modal_y + 44;
+    let sub_h = 26;
+    if modal.mode == BatchMode::Stream {
+        draw_text(
             hdc,
+            "Select an episode to stream immediately:",
             modal_x + 16,
-            row_y,
-            modal_w - 32,
-            item_h - 4,
-            4,
-            bg,
-            if is_sel {
-                Some(COLOR_ACCENT)
-            } else {
-                Some(COLOR_BORDER)
-            },
-        );
-
-        let size_str = format!("{:.1} MB", (file.size_bytes as f64) / (1024.0 * 1024.0));
-        draw_text(
-            hdc,
-            &file.path,
-            modal_x + 24,
-            row_y,
-            modal_w - 120,
-            item_h - 4,
-            fonts.regular,
-            COLOR_TEXT_PRIMARY,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-        draw_text(
-            hdc,
-            &size_str,
-            modal_x + modal_w - 100,
-            row_y,
-            80,
-            item_h - 4,
+            sub_y,
+            modal_w - 200,
+            sub_h,
             fonts.small,
             COLOR_TEXT_MUTED,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+        let total_size: u64 = modal.files.iter().map(|f| f.size_bytes).sum();
+        let stats = format!("Total: {} ({} files)", format_bytes(total_size), modal.files.len());
+        draw_text(
+            hdc,
+            &stats,
+            modal_x + modal_w - 216,
+            sub_y,
+            200,
+            sub_h,
+            fonts.small,
+            COLOR_TEXT_SECONDARY,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        );
+    } else {
+        // Select All button
+        let sel_all_w = 70;
+        let sel_all_x = modal_x + 16;
+        let is_sel_all_hover = state.hovered_control == Some(HoverControl::BatchSelectAll);
+        draw_rounded_rect(
+            hdc,
+            sel_all_x,
+            sub_y,
+            sel_all_w,
+            24,
+            4,
+            if is_sel_all_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+            Some(if is_sel_all_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+        );
+        draw_text(
+            hdc,
+            "Select All",
+            sel_all_x,
+            sub_y,
+            sel_all_w,
+            24,
+            fonts.small,
+            COLOR_TEXT_PRIMARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // Clear button
+        let clear_w = 52;
+        let clear_x = sel_all_x + sel_all_w + 6;
+        let is_clear_hover = state.hovered_control == Some(HoverControl::BatchClearAll);
+        draw_rounded_rect(
+            hdc,
+            clear_x,
+            sub_y,
+            clear_w,
+            24,
+            4,
+            if is_clear_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+            Some(if is_clear_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+        );
+        draw_text(
+            hdc,
+            "Clear",
+            clear_x,
+            sub_y,
+            clear_w,
+            24,
+            fonts.small,
+            COLOR_TEXT_SECONDARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let sel_size: u64 = modal.files.iter().filter(|f| modal.selected_indices.contains(&f.index)).map(|f| f.size_bytes).sum();
+        let stats = format!("Selected: {} / {} · {}", modal.selected_indices.len(), modal.files.len(), format_bytes(sel_size));
+        let stats_x = clear_x + clear_w + 12;
+        draw_text(
+            hdc,
+            &stats,
+            stats_x,
+            sub_y,
+            (modal_x + modal_w - 16 - stats_x).max(0),
+            24,
+            fonts.small_bold,
+            COLOR_TEXT_PRIMARY,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
 
-    // Modal buttons: Play and Cancel
-    let btn_y = modal_y + modal_h - 42;
-    let btn_w = 90;
-    let play_btn_x = modal_x + modal_w - 16 - btn_w;
-    let cancel_btn_x = play_btn_x - 12 - btn_w;
+    // Divider line
+    fill_rect(hdc, modal_x + 16, sub_y + sub_h + 2, modal_w - 32, 1, COLOR_BORDER);
 
-    // Play button
-    let play_hover = state.hovered_control == Some(HoverControl::BatchConfirm);
-    draw_rounded_rect(
-        hdc,
-        play_btn_x,
-        btn_y,
-        btn_w,
-        30,
-        4,
-        if play_hover {
-            COLOR_ACCENT_HOVER
-        } else {
-            COLOR_ACCENT
-        },
-        Some(COLOR_ACCENT_MUTED),
-    );
-    draw_text(
-        hdc,
-        "Play Stream",
-        play_btn_x,
-        btn_y,
-        btn_w,
-        30,
-        fonts.bold,
-        COLOR_TEXT_PRIMARY,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-    );
+    // File list
+    let list_x = modal_x + 16;
+    let list_y = sub_y + sub_h + 6;
+    let list_w = modal_w - 32;
+    let list_h = modal_h - (list_y - modal_y) - 52;
+    let item_h = 36;
+    let mut item_y = list_y - modal.scroll_y;
 
-    // Cancel button
-    let cancel_hover = state.hovered_control == Some(HoverControl::BatchCancel);
-    draw_rounded_rect(
-        hdc,
-        cancel_btn_x,
-        btn_y,
-        btn_w,
-        30,
-        4,
-        if cancel_hover {
-            COLOR_SURFACE_HOVER
+    for (idx, file) in modal.files.iter().enumerate() {
+        if item_y + item_h >= list_y && item_y <= list_y + list_h {
+            let row_r = Rect::new(list_x, item_y, list_w, item_h - 4);
+            let is_row_hover = state.hovered_control == Some(HoverControl::BatchFile(idx));
+            let clean_name = crate::episodes::clean_nyaa_title(&file.path);
+
+            if modal.mode == BatchMode::Stream {
+                let is_watch_hover = state.hovered_control == Some(HoverControl::BatchItemWatch(idx));
+                let bg = if is_row_hover { COLOR_SURFACE_HOVER } else { COLOR_BG };
+                draw_rounded_rect(
+                    hdc,
+                    row_r.x,
+                    row_r.y,
+                    row_r.w,
+                    row_r.h,
+                    4,
+                    bg,
+                    Some(if is_row_hover { COLOR_BORDER_HOVER } else { COLOR_BORDER }),
+                );
+
+                // Episode index badge
+                let ep_badge = format!("{:02}", idx + 1);
+                let bw = draw_badge(
+                    hdc,
+                    &ep_badge,
+                    row_r.x + 8,
+                    row_r.y + 6,
+                    fonts.small_bold,
+                    COLOR_SURFACE,
+                    Some(COLOR_BORDER),
+                    COLOR_TEXT_MUTED,
+                );
+
+                // Watch button
+                let watch_w = 54;
+                let watch_h = 24;
+                let watch_x = row_r.right() - 8 - watch_w;
+                let watch_y = row_r.y + (row_r.h - watch_h) / 2;
+                draw_rounded_rect(
+                    hdc,
+                    watch_x,
+                    watch_y,
+                    watch_w,
+                    watch_h,
+                    4,
+                    if is_watch_hover { COLOR_ACCENT_HOVER } else { COLOR_ACCENT },
+                    Some(COLOR_ACCENT_MUTED),
+                );
+                draw_text(
+                    hdc,
+                    "Watch",
+                    watch_x,
+                    watch_y,
+                    watch_w,
+                    watch_h,
+                    fonts.small_bold,
+                    COLOR_TEXT_PRIMARY,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Size text
+                let size_str = format_bytes(file.size_bytes);
+                let size_w = 68;
+                let size_x = watch_x - 8 - size_w;
+                draw_text(
+                    hdc,
+                    &size_str,
+                    size_x,
+                    row_r.y,
+                    size_w,
+                    row_r.h,
+                    fonts.small,
+                    COLOR_TEXT_MUTED,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Title
+                let title_start = row_r.x + 14 + bw;
+                let title_w = (size_x - title_start - 8).max(0);
+                draw_text(
+                    hdc,
+                    &clean_name,
+                    title_start,
+                    row_r.y,
+                    title_w,
+                    row_r.h,
+                    fonts.regular,
+                    if is_row_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            } else {
+                // Download mode
+                let is_sel = modal.selected_indices.contains(&file.index);
+                let bg = if is_sel { COLOR_CARD_ACTIVE } else if is_row_hover { COLOR_SURFACE_HOVER } else { COLOR_BG };
+                draw_rounded_rect(
+                    hdc,
+                    row_r.x,
+                    row_r.y,
+                    row_r.w,
+                    row_r.h,
+                    4,
+                    bg,
+                    Some(if is_sel { COLOR_ACCENT } else if is_row_hover { COLOR_BORDER_HOVER } else { COLOR_BORDER }),
+                );
+
+                // Checkbox
+                let box_size = 14;
+                let box_x = row_r.x + 10;
+                let box_y = row_r.y + (row_r.h - box_size) / 2;
+                draw_rounded_rect(
+                    hdc,
+                    box_x,
+                    box_y,
+                    box_size,
+                    box_size,
+                    3,
+                    if is_sel { COLOR_ACCENT } else { COLOR_BG },
+                    Some(if is_sel { COLOR_ACCENT } else { COLOR_BORDER }),
+                );
+                if is_sel {
+                    draw_text(
+                        hdc,
+                        "✓",
+                        box_x,
+                        box_y - 1,
+                        box_size,
+                        box_size,
+                        fonts.small_bold,
+                        COLOR_TEXT_PRIMARY,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                    );
+                }
+
+                // Size text
+                let size_str = format_bytes(file.size_bytes);
+                let size_w = 74;
+                let size_x = row_r.right() - 10 - size_w;
+                draw_text(
+                    hdc,
+                    &size_str,
+                    size_x,
+                    row_r.y,
+                    size_w,
+                    row_r.h,
+                    fonts.small,
+                    COLOR_TEXT_MUTED,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Title
+                let title_start = box_x + box_size + 10;
+                let title_w = (size_x - title_start - 8).max(0);
+                draw_text(
+                    hdc,
+                    &clean_name,
+                    title_start,
+                    row_r.y,
+                    title_w,
+                    row_r.h,
+                    fonts.regular,
+                    if is_sel { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
+        }
+        item_y += item_h;
+    }
+
+    // Scrollbar track
+    let total_content_h = (modal.files.len() as i32) * item_h;
+    if total_content_h > list_h && list_h > 0 {
+        let sb_track_w = 4;
+        let sb_x = list_x + list_w - sb_track_w;
+        let thumb_h = ((list_h as f32 / total_content_h as f32) * list_h as f32).max(20.0) as i32;
+        let max_scroll = (total_content_h - list_h).max(1);
+        let thumb_y = list_y + ((modal.scroll_y as f32 / max_scroll as f32) * (list_h - thumb_h) as f32) as i32;
+        draw_rounded_rect(hdc, sb_x, thumb_y, sb_track_w, thumb_h, 2, COLOR_BORDER_HOVER, None);
+    }
+
+    // Footer
+    let footer_y = modal_y + modal_h - 44;
+    let cancel_btn_w = 70;
+    let cancel_btn_x = modal_x + modal_w - 16 - cancel_btn_w;
+    let is_cancel_hover = state.hovered_control == Some(HoverControl::BatchCancel);
+
+    if modal.mode == BatchMode::Stream {
+        draw_text(
+            hdc,
+            "Tip: You can switch episodes anytime from the Playlist sidebar tab.",
+            modal_x + 16,
+            footer_y,
+            (cancel_btn_x - modal_x - 24).max(0),
+            30,
+            fonts.small,
+            COLOR_TEXT_MUTED,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+        draw_rounded_rect(
+            hdc,
+            cancel_btn_x,
+            footer_y,
+            cancel_btn_w,
+            30,
+            4,
+            if is_cancel_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+            Some(COLOR_BORDER),
+        );
+        draw_text(
+            hdc,
+            "Cancel",
+            cancel_btn_x,
+            footer_y,
+            cancel_btn_w,
+            30,
+            fonts.regular,
+            COLOR_TEXT_SECONDARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    } else {
+        let has_sel = !modal.selected_indices.is_empty();
+        let dl_btn_w = 150;
+        let dl_btn_x = modal_x + modal_w - 16 - dl_btn_w;
+        let cancel_x = dl_btn_x - 10 - cancel_btn_w;
+
+        draw_text(
+            hdc,
+            "Files will be saved to your configured download directory.",
+            modal_x + 16,
+            footer_y,
+            (cancel_x - modal_x - 24).max(0),
+            30,
+            fonts.small,
+            COLOR_TEXT_MUTED,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // Cancel
+        draw_rounded_rect(
+            hdc,
+            cancel_x,
+            footer_y,
+            cancel_btn_w,
+            30,
+            4,
+            if is_cancel_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+            Some(COLOR_BORDER),
+        );
+        draw_text(
+            hdc,
+            "Cancel",
+            cancel_x,
+            footer_y,
+            cancel_btn_w,
+            30,
+            fonts.regular,
+            COLOR_TEXT_SECONDARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // Download Selected (N) button
+        let is_dl_hover = state.hovered_control == Some(HoverControl::BatchConfirm);
+        let btn_bg = if has_sel {
+            if is_dl_hover { COLOR_ACCENT_HOVER } else { COLOR_ACCENT }
         } else {
             COLOR_SURFACE
-        },
-        Some(COLOR_BORDER),
-    );
-    draw_text(
-        hdc,
-        "Cancel",
-        cancel_btn_x,
-        btn_y,
-        btn_w,
-        30,
-        fonts.regular,
-        COLOR_TEXT_SECONDARY,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-    );
+        };
+        draw_rounded_rect(
+            hdc,
+            dl_btn_x,
+            footer_y,
+            dl_btn_w,
+            30,
+            4,
+            btn_bg,
+            Some(if has_sel { COLOR_ACCENT_MUTED } else { COLOR_BORDER }),
+        );
+        let dl_label = format!("Download Selected ({})", modal.selected_indices.len());
+        draw_text(
+            hdc,
+            &dl_label,
+            dl_btn_x,
+            footer_y,
+            dl_btn_w,
+            30,
+            fonts.bold,
+            if has_sel { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_MUTED },
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
 }
 
 fn render_tooltip(hdc: HDC, text: &str, tx: i32, ty: i32, fonts: &ThemeFonts) {

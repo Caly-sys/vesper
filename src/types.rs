@@ -55,6 +55,25 @@ pub struct EpisodeEntry {
     pub raw_filename: String,
     pub clean_title: String,
     pub episode_number: Option<f32>,
+    pub torrent_info: Option<(usize, usize)>,
+}
+
+/// Mode for batch torrent selection modal
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchMode {
+    Stream,
+    Download,
+}
+
+/// Result of adding a torrent download
+#[derive(Debug, Clone, PartialEq)]
+pub enum TorrentDownloadAddResult {
+    Started(usize),
+    Batch {
+        id: usize,
+        title: String,
+        files: Vec<TorrentFileInfo>,
+    },
 }
 
 /// Item returned from Nyaa RSS query
@@ -215,6 +234,13 @@ pub enum AppEvent {
     /// Download destination directory changed
     DownloadDirChanged(PathBuf),
     /// Batch torrent file list ready for user selection
+    BatchTorrentResolved {
+        torrent_id: usize,
+        title: String,
+        mode: BatchMode,
+        files: Vec<TorrentFileInfo>,
+    },
+    /// Legacy batch event
     TorrentBatchDiscovered { id: usize, files: Vec<TorrentFileInfo> },
     /// Subtitle track extraction succeeded
     SubtitleExtracted { track_name: String, path: PathBuf },

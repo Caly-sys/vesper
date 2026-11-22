@@ -39,7 +39,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::types::{
-    AppEvent, NyaaCategory, NyaaFilter, NyaaItem, PlayerCommand, StreamStatus, SubCue,
+    AppEvent, BatchMode, NyaaCategory, NyaaFilter, NyaaItem, PlayerCommand, StreamStatus, SubCue,
 };
 use crate::ui::controls::{format_time, render_ui, HoverControl, Tab, UiState};
 use crate::ui::layout::{LayoutGeometry, Rect};
@@ -65,6 +65,10 @@ pub enum UiAction {
     SelectBatchTorrentFile {
         id: usize,
         file_idx: usize,
+    },
+    StartBatchDownload {
+        id: usize,
+        file_indices: Vec<usize>,
     },
     ToggleFullscreen,
     StartTorrentStream {
@@ -812,6 +816,16 @@ impl VesperUi {
                     MouseScrollDelta::PixelDelta(pos) => pos.y as i32,
                 };
 
+                // Scroll modal list if batch modal is open
+                if let Some(ref mut modal) = self.state.batch_modal {
+                    let total_content_h = (modal.files.len() as i32) * 36;
+                    let list_h = (440.min(self.geom.total_height - 60) - 78 - 52).max(1);
+                    let max_scroll = (total_content_h - list_h).max(0);
+                    modal.scroll_y = (modal.scroll_y - scroll_delta).clamp(0, max_scroll);
+                    self.request_redraw();
+                    return true;
+                }
+
                 let (px, _py) = self.state.mouse_pos;
                 if self.geom.drawer_rect.contains(px, self.state.mouse_pos.1) {
                     match self.state.active_tab {
@@ -1050,8 +1064,39 @@ impl VesperUi {
                 self.request_redraw();
             }
 
+            AppEvent::BatchTorrentResolved {
+                torrent_id,
+                title,
+                mode,
+                files,
+            } => {
+                let initial_selection = if *mode == BatchMode::Download {
+                    files.iter().map(|f| f.index).collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                self.state.batch_modal = Some(controls::BatchModalState {
+                    torrent_id: *torrent_id,
+                    title: title.clone(),
+                    mode: *mode,
+                    files: files.clone(),
+                    selected_indices: initial_selection,
+                    scroll_y: 0,
+                });
+                self.set_video_visible(false);
+                self.request_redraw();
+            }
+
             AppEvent::TorrentBatchDiscovered { id, files } => {
-                self.state.batch_modal = Some((*id, files.clone(), 0));
+                self.state.batch_modal = Some(controls::BatchModalState {
+                    torrent_id: *id,
+                    title: format!("Torrent #{}", id),
+                    mode: BatchMode::Stream,
+                    files: files.clone(),
+                    selected_indices: std::collections::HashSet::new(),
+                    scroll_y: 0,
+                });
+                self.set_video_visible(false);
                 self.request_redraw();
             }
 
@@ -1219,32 +1264,61 @@ impl VesperUi {
         }
 
         // Check modal dialog first if open
-        if let Some((_, ref files, _)) = self.state.batch_modal {
-            let modal_w = 480.min(self.geom.total_width - 40);
-            let modal_h = 360.min(self.geom.total_height - 60);
+        if let Some(ref modal) = self.state.batch_modal {
+            let modal_w = 560.min(self.geom.total_width - 40);
+            let modal_h = 440.min(self.geom.total_height - 60);
             let modal_x = (self.geom.total_width - modal_w) / 2;
             let modal_y = (self.geom.total_height - modal_h) / 2;
 
-            let btn_y = modal_y + modal_h - 42;
-            let btn_w = 90;
-            let play_btn_x = modal_x + modal_w - 16 - btn_w;
-            let cancel_btn_x = play_btn_x - 12 - btn_w;
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
 
-            if Rect::new(play_btn_x, btn_y, btn_w, 30).contains(px, py) {
-                new_hover = Some(HoverControl::BatchConfirm);
-            } else if Rect::new(cancel_btn_x, btn_y, btn_w, 30).contains(px, py) {
+            let sub_y = modal_y + 44;
+            let sub_h = 26;
+            let list_x = modal_x + 16;
+            let list_y = sub_y + sub_h + 6;
+            let list_w = modal_w - 32;
+            let list_h = modal_h - (list_y - modal_y) - 52;
+            let item_h = 36;
+
+            let footer_y = modal_y + modal_h - 44;
+            let cancel_btn_w = 70;
+            let cancel_btn_x = modal_x + modal_w - 16 - cancel_btn_w;
+
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py) {
                 new_hover = Some(HoverControl::BatchCancel);
-            } else {
-                let list_y = modal_y + 44;
-                let item_h = 36;
-                for (idx, _) in files.iter().enumerate().take(8) {
-                    let row_y = list_y + (idx as i32) * item_h;
-                    if Rect::new(modal_x + 16, row_y, modal_w - 32, item_h - 4).contains(px, py) {
-                        new_hover = Some(HoverControl::BatchFile(idx));
+            } else if modal.mode == BatchMode::Download && Rect::new(modal_x + 16, sub_y, 70, 24).contains(px, py) {
+                new_hover = Some(HoverControl::BatchSelectAll);
+            } else if modal.mode == BatchMode::Download && Rect::new(modal_x + 16 + 76, sub_y, 52, 24).contains(px, py) {
+                new_hover = Some(HoverControl::BatchClearAll);
+            } else if modal.mode == BatchMode::Download && Rect::new(modal_x + modal_w - 16 - 150, footer_y, 150, 30).contains(px, py) {
+                new_hover = Some(HoverControl::BatchConfirm);
+            } else if Rect::new(if modal.mode == BatchMode::Download { modal_x + modal_w - 16 - 150 - 10 - cancel_btn_w } else { cancel_btn_x }, footer_y, cancel_btn_w, 30).contains(px, py) {
+                new_hover = Some(HoverControl::BatchCancel);
+            } else if Rect::new(list_x, list_y, list_w, list_h).contains(px, py) {
+                let mut item_y = list_y - modal.scroll_y;
+                for (idx, _) in modal.files.iter().enumerate() {
+                    let row_r = Rect::new(list_x, item_y, list_w, item_h - 4);
+                    if row_r.contains(px, py) {
+                        if modal.mode == BatchMode::Stream {
+                            let watch_w = 54;
+                            let watch_x = row_r.right() - 8 - watch_w;
+                            if Rect::new(watch_x, row_r.y, watch_w, row_r.h).contains(px, py) {
+                                new_hover = Some(HoverControl::BatchItemWatch(idx));
+                            } else {
+                                new_hover = Some(HoverControl::BatchFile(idx));
+                            }
+                        } else {
+                            new_hover = Some(HoverControl::BatchFile(idx));
+                        }
                         break;
                     }
+                    item_y += item_h;
                 }
             }
+
             self.state.hovered_control = new_hover;
             self.state.tooltip = None;
             return;
@@ -1523,43 +1597,125 @@ impl VesperUi {
 
     fn handle_mouse_down(&mut self, px: i32, py: i32) -> bool {
         // Modal dialog handling
-        if let Some((torrent_id, ref files, selected_idx)) = self.state.batch_modal {
-            let modal_w = 480.min(self.geom.total_width - 40);
-            let modal_h = 360.min(self.geom.total_height - 60);
+        if let Some(ref modal) = self.state.batch_modal {
+            let modal_w = 560.min(self.geom.total_width - 40);
+            let modal_h = 440.min(self.geom.total_height - 60);
             let modal_x = (self.geom.total_width - modal_w) / 2;
             let modal_y = (self.geom.total_height - modal_h) / 2;
 
-            let btn_y = modal_y + modal_h - 42;
-            let btn_w = 90;
-            let play_btn_x = modal_x + modal_w - 16 - btn_w;
-            let cancel_btn_x = play_btn_x - 12 - btn_w;
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
 
-            if Rect::new(play_btn_x, btn_y, btn_w, 30).contains(px, py) {
-                // Confirm batch selection
-                self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
-                    id: torrent_id,
-                    file_idx: selected_idx,
-                });
+            let sub_y = modal_y + 44;
+            let sub_h = 26;
+            let list_x = modal_x + 16;
+            let list_y = sub_y + sub_h + 6;
+            let list_w = modal_w - 32;
+            let list_h = modal_h - (list_y - modal_y) - 52;
+            let item_h = 36;
+
+            let footer_y = modal_y + modal_h - 44;
+            let cancel_btn_w = 70;
+            let cancel_btn_x = modal_x + modal_w - 16 - cancel_btn_w;
+
+            // Close button (×)
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py) {
                 self.state.batch_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
                 self.request_redraw();
                 return true;
-            } else if Rect::new(cancel_btn_x, btn_y, btn_w, 30).contains(px, py) {
-                // Cancel modal
-                self.state.batch_modal = None;
-                self.request_redraw();
-                return true;
-            } else {
-                let list_y = modal_y + 44;
-                let item_h = 36;
-                for (idx, _) in files.iter().enumerate().take(8) {
-                    let row_y = list_y + (idx as i32) * item_h;
-                    if Rect::new(modal_x + 16, row_y, modal_w - 32, item_h - 4).contains(px, py) {
-                        self.state.batch_modal = Some((torrent_id, files.clone(), idx));
-                        self.request_redraw();
-                        return true;
+            }
+
+            // In Download Mode: Select All / Clear buttons
+            if modal.mode == BatchMode::Download {
+                if Rect::new(modal_x + 16, sub_y, 70, 24).contains(px, py) {
+                    if let Some(ref mut m) = self.state.batch_modal {
+                        m.selected_indices = m.files.iter().map(|f| f.index).collect();
                     }
+                    self.request_redraw();
+                    return true;
+                } else if Rect::new(modal_x + 16 + 76, sub_y, 52, 24).contains(px, py) {
+                    if let Some(ref mut m) = self.state.batch_modal {
+                        m.selected_indices.clear();
+                    }
+                    self.request_redraw();
+                    return true;
                 }
             }
+
+            // Footer Cancel button
+            let cancel_rect = if modal.mode == BatchMode::Download {
+                Rect::new(modal_x + modal_w - 16 - 150 - 10 - cancel_btn_w, footer_y, cancel_btn_w, 30)
+            } else {
+                Rect::new(cancel_btn_x, footer_y, cancel_btn_w, 30)
+            };
+            if cancel_rect.contains(px, py) {
+                self.state.batch_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Footer Download Selected (N) button
+            if modal.mode == BatchMode::Download {
+                let dl_btn_rect = Rect::new(modal_x + modal_w - 16 - 150, footer_y, 150, 30);
+                if dl_btn_rect.contains(px, py) {
+                    if let Some(m) = self.state.batch_modal.take() {
+                        let indices: Vec<usize> = m.selected_indices.into_iter().collect();
+                        if !indices.is_empty() {
+                            self.action_queue.push_back(UiAction::StartBatchDownload {
+                                id: m.torrent_id,
+                                file_indices: indices,
+                            });
+                        }
+                    }
+                    if self.state.duration > 0.0 {
+                        self.set_video_visible(true);
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+            }
+
+            // File items
+            if Rect::new(list_x, list_y, list_w, list_h).contains(px, py) {
+                let mut item_y = list_y - modal.scroll_y;
+                for file in modal.files.iter() {
+                    let row_r = Rect::new(list_x, item_y, list_w, item_h - 4);
+                    if row_r.contains(px, py) {
+                        if modal.mode == BatchMode::Stream {
+                            let torrent_id = modal.torrent_id;
+                            let file_idx = file.index;
+                            self.state.batch_modal = None;
+                            self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
+                                id: torrent_id,
+                                file_idx,
+                            });
+                            self.request_redraw();
+                            return true;
+                        } else {
+                            let file_idx = file.index;
+                            if let Some(ref mut m) = self.state.batch_modal {
+                                if m.selected_indices.contains(&file_idx) {
+                                    m.selected_indices.remove(&file_idx);
+                                } else {
+                                    m.selected_indices.insert(file_idx);
+                                }
+                            }
+                            self.request_redraw();
+                            return true;
+                        }
+                    }
+                    item_y += item_h;
+                }
+            }
+
             return true;
         }
 
@@ -1862,8 +2018,15 @@ impl VesperUi {
                                 self.state.last_ep_click = Some((now, idx));
                                 self.state.active_ep_idx = Some(idx);
 
-                                // Double-click plays episode immediately
-                                if is_double_click {
+                                if let Some(ref torrent_info) = ep.torrent_info {
+                                    // Batch torrent stream episode
+                                    let (t_id, f_idx) = *torrent_info;
+                                    self.action_queue.push_back(UiAction::SelectBatchTorrentFile {
+                                        id: t_id,
+                                        file_idx: f_idx,
+                                    });
+                                } else if is_double_click {
+                                    // Local media file
                                     let ep_path = ep.path.clone();
                                     self.action_queue
                                         .push_back(UiAction::LoadFile(ep_path.clone()));

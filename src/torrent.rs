@@ -30,6 +30,13 @@ pub struct ManagedTaskInfo {
     pub dest_dir: PathBuf,
 }
 
+pub fn is_video_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mkv" | "mp4" | "webm" | "mov" | "avi" | "m4v" | "ts"
+    )
+}
+
 /// Embedded BitTorrent streaming engine utilizing `librqbit` and its internal HTTP API server.
 pub struct TorrentEngine {
     cache_dir: PathBuf,
@@ -173,6 +180,7 @@ impl TorrentEngine {
 
         let mut opts = AddTorrentOptions::default();
         opts.overwrite = true;
+        opts.paused = true;
         opts.output_folder = Some(self.cache_dir.to_string_lossy().to_string());
         if let Some(idx) = selected_file_idx {
             opts.only_files = Some(vec![idx]);
@@ -219,28 +227,28 @@ impl TorrentEngine {
             }
         };
 
-        // Enumerate and classify all files
+        // Enumerate and classify all video files
         let mut all_files = Vec::new();
-        let mut mkv_files = Vec::new();
+        let mut video_files = Vec::new();
 
         for (idx, fi) in metadata.file_infos.iter().enumerate() {
             let rel_path_str = fi.relative_filename.to_string_lossy().to_string();
-            let is_mkv = fi
+            let is_video = fi
                 .relative_filename
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("webm"))
+                .map(is_video_extension)
                 .unwrap_or(false);
 
             let file_info = TorrentFileInfo {
                 index: idx,
                 path: rel_path_str,
                 size_bytes: fi.len,
-                is_mkv,
+                is_mkv: is_video,
             };
 
-            if is_mkv {
-                mkv_files.push(file_info.clone());
+            if is_video {
+                video_files.push(file_info.clone());
             }
             all_files.push(file_info);
         }
@@ -248,6 +256,13 @@ impl TorrentEngine {
         if all_files.is_empty() {
             return Err("Torrent contains no files".to_string());
         }
+
+        let mut candidates = if !video_files.is_empty() {
+            video_files
+        } else {
+            all_files
+        };
+        candidates.sort_by(|a, b| crate::episodes::natural_cmp(&a.path, &b.path));
 
         let file_idx = match selected_file_idx {
             Some(idx) => {
@@ -257,30 +272,24 @@ impl TorrentEngine {
                 idx
             }
             None => {
-                if mkv_files.len() > 1 {
+                if candidates.len() > 1 {
                     return Ok(StreamStatus::SelectingBatch {
                         id,
-                        files: mkv_files,
-                    });
-                } else if mkv_files.len() == 1 {
-                    mkv_files[0].index
-                } else if all_files.len() > 1 {
-                    return Ok(StreamStatus::SelectingBatch {
-                        id,
-                        files: all_files,
+                        files: candidates,
                     });
                 } else {
-                    all_files[0].index
+                    candidates[0].index
                 }
             }
         };
 
-        // Configure sequential download priority for the chosen file index
+        // Configure sequential download priority for the chosen file index and unpause
         let only_set: HashSet<usize> = [file_idx].into_iter().collect();
         let _ = self
             .api
             .api_torrent_action_update_only_files(id.into(), &only_set)
             .await;
+        let _ = self.api.api_torrent_action_start(id.into()).await;
 
         let title = handle.name().unwrap_or_else(|| format!("Torrent #{id}"));
         let fi = &metadata.file_infos[file_idx];
@@ -337,16 +346,17 @@ impl TorrentEngine {
         &self,
         torrent_url_or_hash: &str,
         dest_dir: &Path,
-        selected_file_idx: Option<usize>,
-    ) -> Result<usize, String> {
+        selected_file_indices: Option<Vec<usize>>,
+    ) -> Result<crate::types::TorrentDownloadAddResult, String> {
         let _ = std::fs::create_dir_all(dest_dir);
         let add = Self::parse_torrent_input(torrent_url_or_hash)?;
 
         let mut opts = AddTorrentOptions::default();
         opts.overwrite = true;
+        opts.paused = true;
         opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
-        if let Some(idx) = selected_file_idx {
-            opts.only_files = Some(vec![idx]);
+        if let Some(ref indices) = selected_file_indices {
+            opts.only_files = Some(indices.clone());
         }
 
         let add_response = self
@@ -364,42 +374,195 @@ impl TorrentEngine {
         };
 
         let title = handle.name().unwrap_or_else(|| format!("Torrent #{id}"));
-        let metadata_arc = handle.metadata.load();
 
-        let (file_rel_path, file_len) = if let Some(m) = metadata_arc.as_ref() {
-            let total_len = m.file_infos.iter().map(|f| f.len).sum::<u64>();
-            if let Some(idx) = selected_file_idx {
-                if let Some(fi) = m.file_infos.get(idx) {
-                    (Some(fi.relative_filename.clone()), fi.len)
-                } else {
-                    (None, total_len)
+        // Wait up to 10 seconds for initial metadata
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle.wait_until_initialized()).await;
+
+        let metadata_arc = handle.metadata.load();
+        let metadata = match metadata_arc.as_ref() {
+            Some(m) => m,
+            None => {
+                {
+                    let mut tasks = self.tasks.write();
+                    tasks.insert(
+                        id,
+                        ManagedTaskInfo {
+                            torrent_id: id,
+                            file_idx: None,
+                            title: title.clone(),
+                            file_rel_path: None,
+                            file_len: 0,
+                            is_stream: false,
+                            dest_dir: dest_dir.to_path_buf(),
+                        },
+                    );
                 }
-            } else if m.file_infos.len() == 1 {
-                (Some(m.file_infos[0].relative_filename.clone()), m.file_infos[0].len)
-            } else {
-                (None, total_len)
+                return Ok(crate::types::TorrentDownloadAddResult::Started(id));
             }
-        } else {
-            (None, 0)
         };
 
+        // Enumerate video files
+        let mut all_files = Vec::new();
+        let mut video_files = Vec::new();
+
+        for (idx, fi) in metadata.file_infos.iter().enumerate() {
+            let rel_path_str = fi.relative_filename.to_string_lossy().to_string();
+            let is_video = fi
+                .relative_filename
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(is_video_extension)
+                .unwrap_or(false);
+
+            let file_info = TorrentFileInfo {
+                index: idx,
+                path: rel_path_str,
+                size_bytes: fi.len,
+                is_mkv: is_video,
+            };
+
+            if is_video {
+                video_files.push(file_info.clone());
+            }
+            all_files.push(file_info);
+        }
+
+        let mut candidates = if !video_files.is_empty() {
+            video_files
+        } else {
+            all_files
+        };
+        candidates.sort_by(|a, b| crate::episodes::natural_cmp(&a.path, &b.path));
+
+        // If explicit file selection was provided, apply and unpause immediately
+        if let Some(indices) = selected_file_indices {
+            let only_set: HashSet<usize> = indices.into_iter().collect();
+            let _ = self.api.api_torrent_action_update_only_files(id.into(), &only_set).await;
+            let _ = self.api.api_torrent_action_start(id.into()).await;
+            let total_len: u64 = metadata.file_infos.iter().enumerate()
+                .filter(|(i, _)| only_set.contains(i))
+                .map(|(_, f)| f.len)
+                .sum();
+            {
+                let mut tasks = self.tasks.write();
+                tasks.insert(
+                    id,
+                    ManagedTaskInfo {
+                        torrent_id: id,
+                        file_idx: if only_set.len() == 1 { only_set.iter().next().copied() } else { None },
+                        title,
+                        file_rel_path: None,
+                        file_len: total_len,
+                        is_stream: false,
+                        dest_dir: dest_dir.to_path_buf(),
+                    },
+                );
+            }
+            return Ok(crate::types::TorrentDownloadAddResult::Started(id));
+        }
+
+        // Batch torrent (2 or more candidate videos): prompt user via batch modal!
+        if candidates.len() > 1 {
+            return Ok(crate::types::TorrentDownloadAddResult::Batch {
+                id,
+                title,
+                files: candidates,
+            });
+        }
+
+        // Single video file: unpause and download immediately
+        let single_idx = candidates[0].index;
+        let only_set: HashSet<usize> = [single_idx].into_iter().collect();
+        let _ = self.api.api_torrent_action_update_only_files(id.into(), &only_set).await;
+        let _ = self.api.api_torrent_action_start(id.into()).await;
+        let single_file = &metadata.file_infos[single_idx];
         {
             let mut tasks = self.tasks.write();
             tasks.insert(
                 id,
                 ManagedTaskInfo {
                     torrent_id: id,
-                    file_idx: selected_file_idx,
+                    file_idx: Some(single_idx),
                     title,
-                    file_rel_path,
-                    file_len,
+                    file_rel_path: Some(single_file.relative_filename.clone()),
+                    file_len: single_file.len,
                     is_stream: false,
                     dest_dir: dest_dir.to_path_buf(),
                 },
             );
         }
+        Ok(crate::types::TorrentDownloadAddResult::Started(id))
+    }
 
-        Ok(id)
+    /// Selectively update files to download and unpause for a batch torrent
+    pub async fn set_torrent_only_files(&self, id: usize, file_indices: &[usize]) -> Result<(), String> {
+        let only_set: HashSet<usize> = file_indices.iter().copied().collect();
+        self.api
+            .api_torrent_action_update_only_files(id.into(), &only_set)
+            .await
+            .map_err(|e| format!("Failed to update files for torrent #{id}: {e}"))?;
+
+        if let Some(h) = self.session.get(id.into()) {
+            if let Some(m) = h.metadata.load().as_ref() {
+                let mut tasks = self.tasks.write();
+                if let Some(t) = tasks.get_mut(&id) {
+                    if file_indices.len() == 1 {
+                        let idx = file_indices[0];
+                        t.file_idx = Some(idx);
+                        if let Some(fi) = m.file_infos.get(idx) {
+                            t.file_rel_path = Some(fi.relative_filename.clone());
+                            t.file_len = fi.len;
+                        }
+                    } else {
+                        t.file_idx = None;
+                        t.file_rel_path = None;
+                        t.file_len = m.file_infos.iter().enumerate()
+                            .filter(|(i, _)| only_set.contains(i))
+                            .map(|(_, f)| f.len)
+                            .sum();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Retrieve all video files in a batch torrent naturally sorted
+    pub fn get_torrent_files(&self, id: usize) -> Option<Vec<TorrentFileInfo>> {
+        let handle = self.session.get(id.into())?;
+        let metadata_arc = handle.metadata.load();
+        let metadata = metadata_arc.as_ref()?;
+        let mut video_files = Vec::new();
+        let mut all_files = Vec::new();
+
+        for (idx, fi) in metadata.file_infos.iter().enumerate() {
+            let rel_path_str = fi.relative_filename.to_string_lossy().to_string();
+            let is_video = fi
+                .relative_filename
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(is_video_extension)
+                .unwrap_or(false);
+
+            let info = TorrentFileInfo {
+                index: idx,
+                path: rel_path_str,
+                size_bytes: fi.len,
+                is_mkv: is_video,
+            };
+            if is_video {
+                video_files.push(info.clone());
+            }
+            all_files.push(info);
+        }
+
+        let mut res = if !video_files.is_empty() {
+            video_files
+        } else {
+            all_files
+        };
+        res.sort_by(|a, b| crate::episodes::natural_cmp(&a.path, &b.path));
+        Some(res)
     }
 
     /// Checks status for active stream playback
@@ -761,9 +924,24 @@ mod stub {
             &self,
             _torrent_input: &str,
             _dest_dir: &Path,
-            _file_idx: Option<usize>,
-        ) -> Result<usize, String> {
+            _selected_file_indices: Option<Vec<usize>>,
+        ) -> Result<crate::types::TorrentDownloadAddResult, String> {
             Err("Torrent downloading requires compiling with '--features torrent'".to_string())
+        }
+
+        pub async fn set_torrent_only_files(
+            &self,
+            _id: usize,
+            _file_indices: &[usize],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub fn get_torrent_files(
+            &self,
+            _id: usize,
+        ) -> Option<Vec<crate::types::TorrentFileInfo>> {
+            None
         }
 
         pub fn poll_status(&self, _torrent_id: usize) -> StreamStatus {

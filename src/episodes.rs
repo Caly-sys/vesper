@@ -182,7 +182,7 @@ pub fn scan_folder_episodes(folder: &Path) -> Vec<EpisodeEntry> {
                 .and_then(|ext| ext.to_str())
                 .map(|ext| {
                     let ext = ext.to_ascii_lowercase();
-                    ext == "mkv" || ext == "mp4" || ext == "webm" || ext == "avi"
+                    ext == "mkv" || ext == "mp4" || ext == "webm" || ext == "avi" || ext == "mov" || ext == "m4v"
                 })
                 .unwrap_or(false);
 
@@ -202,6 +202,7 @@ pub fn scan_folder_episodes(folder: &Path) -> Vec<EpisodeEntry> {
                     raw_filename,
                     clean_title,
                     episode_number,
+                    torrent_info: None,
                 });
             }
         }
