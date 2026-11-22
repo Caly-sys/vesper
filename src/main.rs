@@ -477,12 +477,22 @@ fn main() -> Result<()> {
                         }
 
                         UiAction::StreamNyaa(item) => {
-                            let link = item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                            let torrent_url = if !item.link.is_empty()
+                                && (item.link.ends_with(".torrent")
+                                    || item.link.contains("/download/"))
+                            {
+                                Some(item.link.clone())
+                            } else {
+                                None
+                            };
+                            let magnet_url =
+                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+
                             // Direct HTTP/HTTPS/HLS stream URL (e.g. mp4, mkv, m3u8)
-                            if crate::stream::is_direct_stream_url(&link) {
-                                info!("Direct HTTP/HTTPS stream URL detected: {link}");
+                            if crate::stream::is_direct_stream_url(&item.link) {
+                                info!("Direct HTTP/HTTPS stream URL detected: {}", item.link);
                                 if let Some(p) = player.as_mut() {
-                                    let _ = p.load(&link);
+                                    let _ = p.load(&item.link);
                                 }
                                 ui.set_video_visible(true);
                                 current_file_path = None;
@@ -499,18 +509,33 @@ fn main() -> Result<()> {
                             if let Some(engine) = torrent_engine.as_ref() {
                                 let engine = engine.clone();
                                 let proxy = event_proxy.clone();
-                                info!("Starting stream for Nyaa torrent: {}", item.clean_title);
+                                let title = item.clean_title.clone();
+                                info!("Starting stream for Nyaa torrent: {title}");
 
                                 runtime.spawn(async move {
                                     let _ = proxy.send_event(AppEvent::TorrentStatusChanged(
-                                        StreamStatus::Connecting { title: item.clean_title.clone() },
+                                        StreamStatus::Connecting {
+                                            title: title.clone(),
+                                        },
                                     ));
 
-                                    match engine.add_torrent_stream(&link, None).await {
+                                    let mut result = Err("No torrent source".to_string());
+                                    if let Some(ref url) = torrent_url {
+                                        info!("Trying .torrent download URL first: {url}");
+                                        result = engine.add_torrent_stream(url, None).await;
+                                        if let Err(ref e) = result {
+                                            warn!("Failed to stream via .torrent URL ({e}), falling back to magnet");
+                                        }
+                                    }
+                                    if result.is_err() {
+                                        result = engine.add_torrent_stream(&magnet_url, None).await;
+                                    }
+
+                                    match result {
                                         Ok(StreamStatus::SelectingBatch { id, files }) => {
                                             let _ = proxy.send_event(AppEvent::BatchTorrentResolved {
                                                 torrent_id: id,
-                                                title: item.clean_title.clone(),
+                                                title: title.clone(),
                                                 mode: BatchMode::Stream,
                                                 files,
                                             });
@@ -527,7 +552,7 @@ fn main() -> Result<()> {
                                     }
                                 });
                             } else {
-                                let _ = crate::stream::open_external(&link);
+                                let _ = crate::stream::open_external(&magnet_url);
                                 ui.handle_app_event(&AppEvent::StatusMessage(
                                     "Opened in external torrent client".to_string(),
                                 ));
@@ -573,7 +598,11 @@ fn main() -> Result<()> {
                             }
                         }
 
-                        UiAction::StartTorrentDownload { source, title } => {
+                        UiAction::StartTorrentDownload {
+                            source,
+                            fallback_source,
+                            title,
+                        } => {
                             if let Some(engine) = torrent_engine.as_ref() {
                                 let engine = engine.clone();
                                 let proxy = event_proxy.clone();
@@ -581,26 +610,52 @@ fn main() -> Result<()> {
                                 info!("Starting torrent download: {title} to {:?}", dest);
 
                                 runtime.spawn(async move {
-                                    match engine.add_torrent_download(&source, &dest, None).await {
-                                        Ok(TorrentDownloadAddResult::Batch { id, title: batch_title, files }) => {
-                                            let _ = proxy.send_event(AppEvent::BatchTorrentResolved {
-                                                torrent_id: id,
-                                                title: batch_title,
-                                                mode: BatchMode::Download,
-                                                files,
-                                            });
+                                    let mut result =
+                                        engine.add_torrent_download(&source, &dest, None).await;
+                                    if result.is_err() {
+                                        if let Some(ref fb) = fallback_source {
+                                            warn!(
+                                                "Failed download via primary source ({:?}), trying fallback",
+                                                result
+                                            );
+                                            result = engine
+                                                .add_torrent_download(fb, &dest, None)
+                                                .await;
+                                        }
+                                    }
+
+                                    match result {
+                                        Ok(TorrentDownloadAddResult::Batch {
+                                            id,
+                                            title: batch_title,
+                                            files,
+                                        }) => {
+                                            let _ =
+                                                proxy.send_event(AppEvent::BatchTorrentResolved {
+                                                    torrent_id: id,
+                                                    title: batch_title,
+                                                    mode: BatchMode::Download,
+                                                    files,
+                                                });
                                         }
                                         Ok(TorrentDownloadAddResult::Started(id)) => {
                                             info!("Torrent download #{id} queued for '{title}'");
-                                            let _ = proxy.send_event(AppEvent::StatusMessage(format!(
-                                                "Downloading '{title}'..."
-                                            )));
+                                            let _ =
+                                                proxy.send_event(AppEvent::StatusMessage(format!(
+                                                    "Downloading '{title}'..."
+                                                )));
                                         }
                                         Err(err) => {
                                             error!("Failed to add torrent download: {err}");
-                                            let _ = proxy.send_event(AppEvent::StatusMessage(format!(
-                                                "Download error: {err}"
-                                            )));
+                                            let _ =
+                                                proxy.send_event(AppEvent::StatusMessage(format!(
+                                                    "Download error: {err}"
+                                                )));
+                                            let _ = proxy.send_event(
+                                                AppEvent::TorrentStatusChanged(
+                                                    StreamStatus::Error(err),
+                                                ),
+                                            );
                                         }
                                     }
                                 });

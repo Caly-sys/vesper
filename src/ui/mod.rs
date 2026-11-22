@@ -77,6 +77,7 @@ pub enum UiAction {
     },
     StartTorrentDownload {
         source: String,
+        fallback_source: Option<String>,
         title: String,
     },
     PauseTorrent(usize),
@@ -704,6 +705,12 @@ impl VesperUi {
                         .unwrap_or("Torrent")
                         .to_string();
                     if cfg!(feature = "torrent") {
+                        self.state.torrent_status_text =
+                            "Fetching torrent file list...".to_string();
+                        self.state.status_message = Some((
+                            "Fetching torrent file list...".to_string(),
+                            Instant::now(),
+                        ));
                         self.action_queue.push_back(UiAction::StartTorrentStream {
                             source: p.to_string_lossy().to_string(),
                             title: filename,
@@ -1036,6 +1043,14 @@ impl VesperUi {
 
             AppEvent::TorrentStatusChanged(status) => {
                 match status {
+                    StreamStatus::Connecting { title: _ }
+                    | StreamStatus::DownloadingMetadata { title: _ } => {
+                        self.state.torrent_status_text =
+                            "Fetching torrent file list...".to_string();
+                    }
+                    StreamStatus::SelectingBatch { .. } => {
+                        self.state.torrent_status_text.clear();
+                    }
                     StreamStatus::Streaming {
                         title,
                         is_complete,
@@ -1059,7 +1074,6 @@ impl VesperUi {
                     StreamStatus::Error(e) => {
                         self.state.torrent_status_text = format!("Torrent error: {}", e);
                     }
-                    _ => {}
                 }
                 self.request_redraw();
             }
@@ -1070,6 +1084,7 @@ impl VesperUi {
                 mode,
                 files,
             } => {
+                self.state.torrent_status_text.clear();
                 let initial_selection = if *mode == BatchMode::Download {
                     files.iter().map(|f| f.index).collect()
                 } else {
@@ -2163,18 +2178,52 @@ impl VesperUi {
                                             self.action_queue.push_back(UiAction::CopyText(magnet));
                                             return true;
                                         } else if Rect::new(dl_x, btn_y, 58, btn_h).contains(px, py) {
-                                            let source =
-                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            let torrent_url = if !item.link.is_empty()
+                                                && (item.link.ends_with(".torrent")
+                                                    || item.link.contains("/download/"))
+                                            {
+                                                Some(item.link.clone())
+                                            } else {
+                                                None
+                                            };
+                                            let magnet = item.magnet_uri();
+
+                                            let (source, fallback_source) = match (torrent_url, magnet) {
+                                                (Some(t_url), Some(mag)) => (t_url, Some(mag)),
+                                                (Some(t_url), None) => (t_url, None),
+                                                (None, Some(mag)) => (mag, None),
+                                                (None, None) => (item.link.clone(), None),
+                                            };
+
+                                            self.state.torrent_status_text =
+                                                "Fetching torrent file list...".to_string();
+                                            self.state.status_message = Some((
+                                                "Fetching torrent file list...".to_string(),
+                                                Instant::now(),
+                                            ));
                                             self.action_queue.push_back(UiAction::StartTorrentDownload {
                                                 source,
+                                                fallback_source,
                                                 title: item.clean_title.clone(),
                                             });
                                             return true;
                                         } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
+                                            self.state.torrent_status_text =
+                                                "Fetching torrent file list...".to_string();
+                                            self.state.status_message = Some((
+                                                "Fetching torrent file list...".to_string(),
+                                                Instant::now(),
+                                            ));
                                             self.action_queue
                                                 .push_back(UiAction::StreamNyaa(item.clone()));
                                             return true;
                                         } else {
+                                            self.state.torrent_status_text =
+                                                "Fetching torrent file list...".to_string();
+                                            self.state.status_message = Some((
+                                                "Fetching torrent file list...".to_string(),
+                                                Instant::now(),
+                                            ));
                                             self.action_queue
                                                 .push_back(UiAction::StreamNyaa(item.clone()));
                                             return true;
@@ -2361,6 +2410,12 @@ impl VesperUi {
                 };
 
                 if cfg!(feature = "torrent") {
+                    self.state.torrent_status_text =
+                        "Fetching torrent file list...".to_string();
+                    self.state.status_message = Some((
+                        "Fetching torrent file list...".to_string(),
+                        Instant::now(),
+                    ));
                     self.action_queue.push_back(UiAction::StartTorrentStream {
                         source: q.clone(),
                         title,

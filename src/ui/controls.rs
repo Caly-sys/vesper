@@ -1820,6 +1820,21 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
     }
 
     if state.downloads.is_empty() && state.nyaa_results.is_empty() {
+        if state.torrent_status_text == "Fetching torrent file list..." {
+            draw_text(
+                hdc,
+                "Fetching torrent file list...",
+                list_r.x + 20,
+                list_r.y + 40,
+                list_r.w - 40,
+                30,
+                fonts.regular,
+                COLOR_ACCENT,
+                DT_CENTER | DT_SINGLELINE,
+            );
+            return;
+        }
+
         draw_text(
             hdc,
             "Enter keywords to search anime, or paste a magnet: link, .torrent URL, or direct stream.\n\nYou can also drag & drop .torrent files directly into Vesper.",
@@ -1835,6 +1850,34 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
     }
 
     let mut y = list_r.y + 4 - state.nyaa_scroll_y;
+
+    // Status banner if actively resolving torrent metadata
+    if state.torrent_status_text == "Fetching torrent file list..." {
+        let banner_h = 24;
+        let banner_r = Rect::new(list_r.x + 12, y, list_r.w - 24, banner_h);
+        draw_rounded_rect(
+            hdc,
+            banner_r.x,
+            banner_r.y,
+            banner_r.w,
+            banner_r.h,
+            4,
+            COLOR_SURFACE,
+            Some(COLOR_ACCENT),
+        );
+        draw_text(
+            hdc,
+            "Fetching torrent file list...",
+            banner_r.x + 8,
+            banner_r.y,
+            banner_r.w - 16,
+            banner_r.h,
+            fonts.small_bold,
+            COLOR_ACCENT,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        y += banner_h + 8;
+    }
 
     // 1. Render Downloads Section if any tasks exist
     if !state.downloads.is_empty() {

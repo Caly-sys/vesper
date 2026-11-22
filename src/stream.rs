@@ -11,6 +11,7 @@ pub const DEFAULT_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://exodus.desync.com:6969/announce",
 ];
+pub const STANDARD_TRACKERS: &[&str] = DEFAULT_TRACKERS;
 
 /// Constructs a valid magnet URI from a 40-character hex or 32-character base32 infohash
 /// and title, embedding standard trackers alongside the display name.
