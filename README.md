@@ -38,7 +38,7 @@ Designed specifically for anime and media enthusiasts, Vesper combines zero-over
 
 ## Quick Start (Releases)
 
-1. Download the latest `vesper-v<version>-windows-x64.zip` from [GitHub Releases](https://github.com/kelvinsyahputra25-cyber/vesper/releases).
+1. Download the latest `vesper-v<version>-windows-x64.zip` from [GitHub Releases](https://github.com/Caly-sys/vesper/releases).
 2. Extract the archive contents into any local folder.
 3. Launch `vesper.exe`.
 
@@ -58,7 +58,7 @@ Designed specifically for anime and media enthusiasts, Vesper combines zero-over
 
 ```powershell
 # Clone the repository
-git clone https://github.com/kelvinsyahputra25-cyber/vesper.git
+git clone https://github.com/Caly-sys/vesper.git
 cd vesper
 
 # Build optimized release binary
