@@ -45,6 +45,7 @@ pub struct TorrentEngine {
     api: Api,
     http_port: u16,
     tasks: Arc<RwLock<HashMap<usize, ManagedTaskInfo>>>,
+    trackers: Arc<RwLock<Vec<String>>>,
 }
 
 impl TorrentEngine {
@@ -111,7 +112,26 @@ impl TorrentEngine {
             api,
             http_port,
             tasks: Arc::new(RwLock::new(HashMap::new())),
+            trackers: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Update the in-memory pool of merged custom and auto-synced trackers
+    pub fn set_trackers(&self, trackers: Vec<String>) {
+        *self.trackers.write() = trackers;
+    }
+
+    /// Get current list of trackers, falling back to standard trackers if empty
+    pub fn get_trackers(&self) -> Vec<String> {
+        let t = self.trackers.read();
+        if t.is_empty() {
+            crate::stream::DEFAULT_TRACKERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            t.clone()
+        }
     }
 
     /// Synchronously construct `TorrentEngine` on a current or newly created Tokio runtime.
@@ -149,7 +169,7 @@ impl TorrentEngine {
     }
 
     /// Internal parser for adding torrents from magnet URIs, info hashes, file paths, or URLs
-    fn parse_torrent_input(input: &str) -> Result<AddTorrent<'static>, String> {
+    fn parse_torrent_input(input: &str, trackers: &[String]) -> Result<AddTorrent<'static>, String> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err("Torrent target URL/hash cannot be empty".to_string());
@@ -165,15 +185,13 @@ impl TorrentEngine {
         if (trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
             || (trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
         {
-            return Ok(AddTorrent::from_url(crate::stream::build_magnet_uri(trimmed, "Torrent")));
+            let base_mag = crate::stream::build_magnet_uri(trimmed, "Torrent");
+            let enriched = crate::stream::append_trackers_to_magnet(&base_mag, trackers);
+            return Ok(AddTorrent::from_url(enriched));
         }
 
-        if trimmed.starts_with("magnet:?") && !trimmed.contains("&tr=") {
-            let mut enriched = trimmed.to_string();
-            for tr in crate::stream::STANDARD_TRACKERS {
-                enriched.push_str("&tr=");
-                enriched.push_str(&urlencoding::encode(tr));
-            }
+        if trimmed.starts_with("magnet:?") {
+            let enriched = crate::stream::append_trackers_to_magnet(trimmed, trackers);
             return Ok(AddTorrent::from_url(enriched));
         }
 
@@ -186,19 +204,15 @@ impl TorrentEngine {
         torrent_url_or_hash: &str,
         selected_file_idx: Option<usize>,
     ) -> Result<StreamStatus, String> {
-        let add = Self::parse_torrent_input(torrent_url_or_hash)?;
+        let trackers = self.get_trackers();
+        let add = Self::parse_torrent_input(torrent_url_or_hash, &trackers)?;
 
         // If no file was explicitly picked yet, resolve torrent metadata first in list-only mode
         if selected_file_idx.is_none() {
             let mut list_opts = AddTorrentOptions::default();
             list_opts.overwrite = true;
             list_opts.list_only = true;
-            list_opts.trackers = Some(
-                crate::stream::STANDARD_TRACKERS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            );
+            list_opts.trackers = Some(trackers.clone());
             list_opts.output_folder = Some(self.cache_dir.to_string_lossy().to_string());
 
             let add_response = match tokio::time::timeout(
@@ -264,12 +278,7 @@ impl TorrentEngine {
                         batch_opts.paused = true;
                         batch_opts.output_folder =
                             Some(self.cache_dir.to_string_lossy().to_string());
-                        batch_opts.trackers = Some(
-                            crate::stream::STANDARD_TRACKERS
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect(),
-                        );
+                        batch_opts.trackers = Some(trackers.clone());
 
                         let (id, handle) = match self
                             .session
@@ -320,12 +329,7 @@ impl TorrentEngine {
                     single_opts.only_files = Some(vec![file_idx]);
                     single_opts.output_folder =
                         Some(self.cache_dir.to_string_lossy().to_string());
-                    single_opts.trackers = Some(
-                        crate::stream::STANDARD_TRACKERS
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    );
+                    single_opts.trackers = Some(trackers.clone());
 
                     let (id, handle) = match self
                         .session
@@ -439,12 +443,7 @@ impl TorrentEngine {
         opts.paused = false;
         opts.output_folder = Some(self.cache_dir.to_string_lossy().to_string());
         opts.only_files = Some(vec![file_idx]);
-        opts.trackers = Some(
-            crate::stream::STANDARD_TRACKERS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        opts.trackers = Some(trackers.clone());
 
         let add_response = match tokio::time::timeout(
             Duration::from_secs(20),
@@ -537,19 +536,15 @@ impl TorrentEngine {
         selected_file_indices: Option<Vec<usize>>,
     ) -> Result<crate::types::TorrentDownloadAddResult, String> {
         let _ = std::fs::create_dir_all(dest_dir);
-        let add = Self::parse_torrent_input(torrent_url_or_hash)?;
+        let trackers = self.get_trackers();
+        let add = Self::parse_torrent_input(torrent_url_or_hash, &trackers)?;
 
         // If no explicit file indices given, resolve files in list_only mode first
         if selected_file_indices.is_none() {
             let mut list_opts = AddTorrentOptions::default();
             list_opts.overwrite = true;
             list_opts.list_only = true;
-            list_opts.trackers = Some(
-                crate::stream::STANDARD_TRACKERS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            );
+            list_opts.trackers = Some(trackers.clone());
             list_opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
 
             let add_response = match tokio::time::timeout(
@@ -614,12 +609,7 @@ impl TorrentEngine {
                         batch_opts.overwrite = true;
                         batch_opts.paused = true;
                         batch_opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
-                        batch_opts.trackers = Some(
-                            crate::stream::STANDARD_TRACKERS
-                                .iter()
-                                .map(|s| s.to_string())
-                                .collect(),
-                        );
+                        batch_opts.trackers = Some(trackers.clone());
 
                         let (id, handle) = match self
                             .session
@@ -670,12 +660,7 @@ impl TorrentEngine {
                     single_opts.paused = false;
                     single_opts.only_files = Some(vec![single_idx]);
                     single_opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
-                    single_opts.trackers = Some(
-                        crate::stream::STANDARD_TRACKERS
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    );
+                    single_opts.trackers = Some(trackers.clone());
 
                     let (id, handle) = match self
                         .session
@@ -744,12 +729,7 @@ impl TorrentEngine {
         opts.paused = false;
         opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
         opts.only_files = Some(indices.clone());
-        opts.trackers = Some(
-            crate::stream::STANDARD_TRACKERS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        opts.trackers = Some(trackers.clone());
 
         let add_response = match tokio::time::timeout(
             Duration::from_secs(20),
@@ -1239,6 +1219,12 @@ mod stub {
 
         pub fn http_port(&self) -> u16 {
             0
+        }
+
+        pub fn set_trackers(&self, _trackers: Vec<String>) {}
+
+        pub fn get_trackers(&self) -> Vec<String> {
+            Vec::new()
         }
 
         pub async fn add_torrent_stream(

@@ -89,6 +89,13 @@ pub enum UiAction {
     },
     OpenTorrentFolder(PathBuf),
     ChangeDownloadDir,
+    SyncTrackersNow(String),
+    SaveTrackers {
+        auto_sync: bool,
+        url: String,
+        custom_trackers: Vec<String>,
+    },
+    ResetTrackerDefaults,
     CopyText(String),
     OpenExternal(String),
 }
@@ -1337,6 +1344,17 @@ impl VesperUi {
                 self.request_redraw();
             }
 
+            AppEvent::TrackersSynced { count: _, success, message, fetched } => {
+                if *success && !fetched.is_empty() {
+                    self.state.cached_remote_trackers = fetched.clone();
+                }
+                if let Some(ref mut modal) = self.state.trackers_modal {
+                    modal.sync_status = Some(message.clone());
+                }
+                self.state.status_message = Some((message.clone(), Instant::now()));
+                self.request_redraw();
+            }
+
             AppEvent::SubtitleExtracted { track_name, path } => {
                 self.state.status_message = Some((
                     format!("Extracted: {} to {:?}", track_name, path),
@@ -1553,6 +1571,74 @@ impl VesperUi {
             return;
         }
 
+        // Check trackers configuration modal dialog if open
+        if self.state.trackers_modal.is_some() {
+            let modal_w = 560.min(self.geom.total_width - 40);
+            let modal_h = 440.min(self.geom.total_height - 60);
+            let modal_x = (self.geom.total_width - modal_w) / 2;
+            let modal_y = (self.geom.total_height - modal_h) / 2;
+
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
+
+            let chk_x = modal_x + 18;
+            let chk_y = modal_y + 46;
+            let chk_w = 16;
+            let chk_h = 16;
+
+            let sync_btn_w = 82;
+            let sync_btn_h = 26;
+            let sync_btn_x = modal_x + modal_w - 18 - sync_btn_w;
+            let sync_btn_y = modal_y + 92;
+
+            let url_x = modal_x + 18;
+            let url_y = modal_y + 92;
+            let url_w = sync_btn_x - url_x - 8;
+            let url_h = 26;
+
+            let custom_box_x = modal_x + 18;
+            let custom_box_y = modal_y + 164;
+            let custom_box_w = modal_w - 36;
+            let footer_y = modal_y + modal_h - 44;
+            let custom_box_h = footer_y - custom_box_y - 10;
+
+            let reset_w = 110;
+            let reset_h = 30;
+            let reset_x = modal_x + 18;
+
+            let cancel_w = 70;
+            let cancel_h = 30;
+            let cancel_x = modal_x + modal_w - 18 - cancel_w;
+
+            let save_w = 80;
+            let save_h = 30;
+            let save_x = cancel_x - 10 - save_w;
+
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalClose);
+            } else if Rect::new(chk_x, chk_y, chk_w + 300, chk_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalAutoSyncToggle);
+            } else if Rect::new(sync_btn_x, sync_btn_y, sync_btn_w, sync_btn_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalSyncNow);
+            } else if Rect::new(url_x, url_y, url_w, url_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalUrlInput);
+            } else if Rect::new(custom_box_x, custom_box_y, custom_box_w, custom_box_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalCustomInput);
+            } else if Rect::new(reset_x, footer_y, reset_w, reset_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalReset);
+            } else if Rect::new(cancel_x, footer_y, cancel_w, cancel_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalClose);
+            } else if Rect::new(save_x, footer_y, save_w, save_h).contains(px, py) {
+                new_hover = Some(HoverControl::TrackersModalSave);
+            }
+
+            self.state.hovered_control = new_hover;
+            self.state.tooltip = None;
+            return;
+        }
+
         // Check category dropdown items if open
         if self.state.category_dropdown_open {
             let dd = &self.geom.nyaa_category_dropdown;
@@ -1718,6 +1804,13 @@ impl VesperUi {
                                 format!("Download folder: {}", self.state.download_dir.display()),
                                 px,
                                 self.geom.stream_download_dir_btn.bottom() + 4,
+                            ));
+                        } else if self.geom.stream_trackers_btn.contains(px, py) {
+                            new_hover = Some(HoverControl::StreamTrackersBtn);
+                            new_tooltip = Some((
+                                "Configure BitTorrent trackers".to_string(),
+                                px,
+                                self.geom.stream_trackers_btn.bottom() + 4,
                             ));
                         } else if self.geom.nyaa_results_list.contains(px, py) {
                             let mut y =
@@ -1954,6 +2047,143 @@ impl VesperUi {
                 }
             }
 
+            return true;
+        }
+
+        // Trackers configuration modal click handling
+        if let Some(ref modal) = self.state.trackers_modal {
+            let modal_w = 560.min(self.geom.total_width - 40);
+            let modal_h = 440.min(self.geom.total_height - 60);
+            let modal_x = (self.geom.total_width - modal_w) / 2;
+            let modal_y = (self.geom.total_height - modal_h) / 2;
+
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
+
+            let chk_x = modal_x + 18;
+            let chk_y = modal_y + 46;
+            let chk_w = 16;
+            let chk_h = 16;
+
+            let sync_btn_w = 82;
+            let sync_btn_h = 26;
+            let sync_btn_x = modal_x + modal_w - 18 - sync_btn_w;
+            let sync_btn_y = modal_y + 92;
+
+            let url_x = modal_x + 18;
+            let url_y = modal_y + 92;
+            let url_w = sync_btn_x - url_x - 8;
+            let url_h = 26;
+
+            let custom_box_x = modal_x + 18;
+            let custom_box_y = modal_y + 164;
+            let custom_box_w = modal_w - 36;
+            let footer_y = modal_y + modal_h - 44;
+            let custom_box_h = footer_y - custom_box_y - 10;
+
+            let reset_w = 110;
+            let reset_h = 30;
+            let reset_x = modal_x + 18;
+
+            let cancel_w = 70;
+            let cancel_h = 30;
+            let cancel_x = modal_x + modal_w - 18 - cancel_w;
+
+            let save_w = 80;
+            let save_h = 30;
+            let save_x = cancel_x - 10 - save_w;
+
+            // Close (×) or Cancel
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py)
+                || Rect::new(cancel_x, footer_y, cancel_w, cancel_h).contains(px, py)
+            {
+                self.state.trackers_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Auto-sync checkbox
+            if Rect::new(chk_x, chk_y, chk_w + 300, chk_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.trackers_modal {
+                    m.auto_sync = !m.auto_sync;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Sync Now button
+            if Rect::new(sync_btn_x, sync_btn_y, sync_btn_w, sync_btn_h).contains(px, py) {
+                let url = modal.tracker_url.clone();
+                if let Some(ref mut m) = self.state.trackers_modal {
+                    m.sync_status = Some("Syncing trackers...".to_string());
+                }
+                self.action_queue.push_back(UiAction::SyncTrackersNow(url));
+                self.request_redraw();
+                return true;
+            }
+
+            // URL input box focus
+            if Rect::new(url_x, url_y, url_w, url_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.trackers_modal {
+                    m.focused_field = controls::TrackersFocusedField::Url;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Custom trackers box focus
+            if Rect::new(custom_box_x, custom_box_y, custom_box_w, custom_box_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.trackers_modal {
+                    m.focused_field = controls::TrackersFocusedField::Custom;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Reset Defaults button
+            if Rect::new(reset_x, footer_y, reset_w, reset_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.trackers_modal {
+                    m.auto_sync = true;
+                    m.tracker_url = crate::config::default_tracker_list_url();
+                    m.sync_status = Some("Defaults restored".to_string());
+                }
+                self.action_queue.push_back(UiAction::ResetTrackerDefaults);
+                self.request_redraw();
+                return true;
+            }
+
+            // Save button
+            if Rect::new(save_x, footer_y, save_w, save_h).contains(px, py) {
+                if let Some(m) = self.state.trackers_modal.take() {
+                    let custom: Vec<String> = m
+                        .custom_text
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && (s.starts_with("udp://") || s.starts_with("http://") || s.starts_with("https://") || s.starts_with("wss://")))
+                        .collect();
+                    self.action_queue.push_back(UiAction::SaveTrackers {
+                        auto_sync: m.auto_sync,
+                        url: m.tracker_url,
+                        custom_trackers: custom,
+                    });
+                }
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Clicking elsewhere in modal clears focus
+            if let Some(ref mut m) = self.state.trackers_modal {
+                m.focused_field = controls::TrackersFocusedField::None;
+            }
+            self.request_redraw();
             return true;
         }
 
@@ -2321,6 +2551,21 @@ impl VesperUi {
                         return true;
                     }
 
+                    if self.geom.stream_trackers_btn.contains(px, py) {
+                        let custom_text = self.state.custom_trackers.join("\r\n");
+                        self.state.trackers_modal = Some(controls::TrackersModalState {
+                            auto_sync: self.state.auto_sync_trackers,
+                            tracker_url: self.state.tracker_list_url.clone(),
+                            custom_text,
+                            sync_status: None,
+                            focused_field: controls::TrackersFocusedField::None,
+                            scroll_y: 0,
+                        });
+                        self.set_video_visible(false);
+                        self.request_redraw();
+                        return true;
+                    }
+
                     if self.geom.nyaa_results_list.contains(px, py) {
                         let mut y =
                             self.geom.nyaa_results_list.y + 4 - self.state.nyaa_scroll_y;
@@ -2481,6 +2726,94 @@ impl VesperUi {
     }
 
     fn handle_key_down(&mut self, logical_key: &Key) -> bool {
+        // Trackers configuration modal keyboard input
+        if let Some(ref mut modal) = self.state.trackers_modal {
+            if logical_key == &Key::Named(NamedKey::Escape) {
+                self.state.trackers_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            if self.modifiers.control_key() {
+                if let Key::Character(s) = logical_key {
+                    if s.eq_ignore_ascii_case("v") {
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            if let Ok(text) = clip.get_text() {
+                                match modal.focused_field {
+                                    controls::TrackersFocusedField::Url => {
+                                        modal.tracker_url.push_str(text.trim());
+                                    }
+                                    controls::TrackersFocusedField::Custom => {
+                                        modal.custom_text.push_str(&text);
+                                    }
+                                    controls::TrackersFocusedField::None => {}
+                                }
+                                self.request_redraw();
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            match modal.focused_field {
+                controls::TrackersFocusedField::Url => {
+                    match logical_key {
+                        Key::Named(NamedKey::Backspace) => {
+                            modal.tracker_url.pop();
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Named(NamedKey::Space) => {
+                            modal.tracker_url.push(' ');
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Character(s) => {
+                            modal.tracker_url.push_str(s);
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            modal.focused_field = controls::TrackersFocusedField::None;
+                            self.request_redraw();
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
+                controls::TrackersFocusedField::Custom => {
+                    match logical_key {
+                        Key::Named(NamedKey::Backspace) => {
+                            modal.custom_text.pop();
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            modal.custom_text.push('\n');
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Named(NamedKey::Space) => {
+                            modal.custom_text.push(' ');
+                            self.request_redraw();
+                            return true;
+                        }
+                        Key::Character(s) => {
+                            modal.custom_text.push_str(s);
+                            self.request_redraw();
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
+                controls::TrackersFocusedField::None => return true,
+            }
+        }
+
         // Keyboard shortcuts for native file/folder dialogs: Ctrl+O and Ctrl+Shift+O
         if self.modifiers.control_key() {
             if let Key::Character(s) = logical_key {

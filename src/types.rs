@@ -251,6 +251,13 @@ pub enum AppEvent {
     DownloadCompleted(PathBuf),
     /// Download destination directory changed
     DownloadDirChanged(PathBuf),
+    /// Public/custom trackers synchronized
+    TrackersSynced {
+        count: usize,
+        success: bool,
+        message: String,
+        fetched: Vec<String>,
+    },
     /// Batch torrent file list ready for user selection
     BatchTorrentResolved {
         torrent_id: usize,

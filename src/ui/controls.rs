@@ -66,6 +66,31 @@ pub enum HoverControl {
     BatchClearAll,
     BatchConfirm,
     BatchCancel,
+    StreamTrackersBtn,
+    TrackersModalClose,
+    TrackersModalAutoSyncToggle,
+    TrackersModalUrlInput,
+    TrackersModalSyncNow,
+    TrackersModalCustomInput,
+    TrackersModalSave,
+    TrackersModalReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackersFocusedField {
+    None,
+    Url,
+    Custom,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackersModalState {
+    pub auto_sync: bool,
+    pub tracker_url: String,
+    pub custom_text: String,
+    pub sync_status: Option<String>,
+    pub focused_field: TrackersFocusedField,
+    pub scroll_y: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +157,13 @@ pub struct UiState {
 
     // Batch torrent selection modal
     pub batch_modal: Option<BatchModalState>,
+
+    // Trackers configuration modal & pool
+    pub trackers_modal: Option<TrackersModalState>,
+    pub auto_sync_trackers: bool,
+    pub tracker_list_url: String,
+    pub custom_trackers: Vec<String>,
+    pub cached_remote_trackers: Vec<String>,
 
     // Interaction
     pub hovered_control: Option<HoverControl>,
@@ -200,6 +232,12 @@ impl Default for UiState {
             downloads: Vec::new(),
 
             batch_modal: None,
+
+            trackers_modal: None,
+            auto_sync_trackers: true,
+            tracker_list_url: crate::config::default_tracker_list_url(),
+            custom_trackers: Vec::new(),
+            cached_remote_trackers: Vec::new(),
 
             hovered_control: None,
             is_dragging_seekbar: false,
@@ -623,9 +661,11 @@ pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &Theme
         }
     }
 
-    // 5. Render modal dialog if open (e.g. batch torrent selection)
+    // 5. Render modal dialog if open (e.g. batch torrent selection, trackers configuration)
     if let Some(ref modal) = state.batch_modal {
         render_batch_modal(hdc, geom, modal, fonts, state);
+    } else if let Some(ref modal) = state.trackers_modal {
+        render_trackers_modal(hdc, geom, modal, fonts, state);
     }
 
     // 6. Render active tooltip
@@ -1948,16 +1988,57 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("Downloads");
-    let df_label = format!("DIR: {}", folder_name);
+    let df_label = if df.w < 65 {
+        "DIR".to_string()
+    } else {
+        format!("DIR: {}", folder_name)
+    };
     draw_text(
         hdc,
         &df_label,
-        df.x + 4,
+        df.x + 2,
         df.y,
-        df.w - 8,
+        df.w - 4,
         df.h,
         fonts.small_bold,
         if df_hover {
+            COLOR_TEXT_PRIMARY
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Trackers Settings button
+    let tr_btn = &geom.stream_trackers_btn;
+    let tr_hover = state.hovered_control == Some(HoverControl::StreamTrackersBtn);
+    draw_rounded_rect(
+        hdc,
+        tr_btn.x,
+        tr_btn.y,
+        tr_btn.w,
+        tr_btn.h,
+        4,
+        if tr_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if tr_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        "TRACKERS",
+        tr_btn.x + 2,
+        tr_btn.y,
+        tr_btn.w - 4,
+        tr_btn.h,
+        fonts.small_bold,
+        if tr_hover {
             COLOR_TEXT_PRIMARY
         } else {
             COLOR_TEXT_SECONDARY
@@ -3160,6 +3241,411 @@ fn render_batch_modal(
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
     }
+}
+
+fn render_trackers_modal(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    modal: &TrackersModalState,
+    fonts: &ThemeFonts,
+    state: &UiState,
+) {
+    let modal_w = 560.min(geom.total_width - 40);
+    let modal_h = 440.min(geom.total_height - 60);
+    let modal_x = (geom.total_width - modal_w) / 2;
+    let modal_y = (geom.total_height - modal_h) / 2;
+
+    // Dark dimming backdrop over main client area
+    fill_rect(hdc, 0, 0, geom.total_width, geom.total_height, COLOR_VIEWPORT_BG);
+
+    // Modal container (#141418 surface, #2A2A34 border)
+    draw_rounded_rect(
+        hdc,
+        modal_x,
+        modal_y,
+        modal_w,
+        modal_h,
+        8,
+        COLOR_SURFACE,
+        Some(COLOR_BORDER),
+    );
+
+    // Header close button (26x24)
+    let close_btn_w = 26;
+    let close_btn_h = 24;
+    let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+    let close_btn_y = modal_y + 12;
+    let is_close_hover = state.hovered_control == Some(HoverControl::TrackersModalClose);
+    draw_rounded_rect(
+        hdc,
+        close_btn_x,
+        close_btn_y,
+        close_btn_w,
+        close_btn_h,
+        4,
+        if is_close_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_close_hover { COLOR_ERROR } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "×",
+        close_btn_x,
+        close_btn_y - 1,
+        close_btn_w,
+        close_btn_h,
+        fonts.bold,
+        if is_close_hover { COLOR_ERROR } else { COLOR_TEXT_MUTED },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Badge
+    let bw = draw_badge(
+        hdc,
+        "TRACKERS",
+        modal_x + 16,
+        modal_y + 14,
+        fonts.small_bold,
+        COLOR_BG,
+        Some(COLOR_ACCENT),
+        COLOR_ACCENT,
+    );
+
+    // Modal title
+    let title_x = modal_x + 22 + bw;
+    let title_max_w = (close_btn_x - title_x - 12).max(0);
+    draw_text(
+        hdc,
+        "Public & Custom Trackers",
+        title_x,
+        modal_y + 12,
+        title_max_w,
+        24,
+        fonts.heading,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Auto-sync Checkbox row (modal_y + 46)
+    let chk_x = modal_x + 18;
+    let chk_y = modal_y + 46;
+    let chk_w = 16;
+    let chk_h = 16;
+    let is_chk_hover = state.hovered_control == Some(HoverControl::TrackersModalAutoSyncToggle);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        chk_y,
+        chk_w,
+        chk_h,
+        3,
+        if modal.auto_sync { COLOR_ACCENT } else { COLOR_BG },
+        Some(if is_chk_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    if modal.auto_sync {
+        draw_text(
+            hdc,
+            "✓",
+            chk_x,
+            chk_y - 1,
+            chk_w,
+            chk_h,
+            fonts.small_bold,
+            COLOR_TEXT_PRIMARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+    draw_text(
+        hdc,
+        "Auto-sync public trackers list on startup",
+        chk_x + 24,
+        chk_y - 2,
+        modal_w - 60,
+        20,
+        fonts.regular,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // URL row (modal_y + 72)
+    draw_text(
+        hdc,
+        "Remote Tracker List URL:",
+        modal_x + 18,
+        modal_y + 72,
+        200,
+        18,
+        fonts.small_bold,
+        COLOR_TEXT_SECONDARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+    if let Some(ref status) = modal.sync_status {
+        let is_err = status.starts_with("Sync failed");
+        draw_text(
+            hdc,
+            status,
+            modal_x + 220,
+            modal_y + 72,
+            modal_w - 238,
+            18,
+            fonts.small_bold,
+            if is_err { COLOR_ERROR } else { COLOR_SUCCESS },
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+
+    let sync_btn_w = 82;
+    let sync_btn_h = 26;
+    let sync_btn_x = modal_x + modal_w - 18 - sync_btn_w;
+    let sync_btn_y = modal_y + 92;
+    let is_sync_hover = state.hovered_control == Some(HoverControl::TrackersModalSyncNow);
+    draw_rounded_rect(
+        hdc,
+        sync_btn_x,
+        sync_btn_y,
+        sync_btn_w,
+        sync_btn_h,
+        4,
+        if is_sync_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_sync_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "Sync Now",
+        sync_btn_x,
+        sync_btn_y,
+        sync_btn_w,
+        sync_btn_h,
+        fonts.small_bold,
+        if is_sync_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    let url_x = modal_x + 18;
+    let url_y = modal_y + 92;
+    let url_w = sync_btn_x - url_x - 8;
+    let url_h = 26;
+    let is_url_focused = modal.focused_field == TrackersFocusedField::Url;
+    draw_rounded_rect(
+        hdc,
+        url_x,
+        url_y,
+        url_w,
+        url_h,
+        4,
+        COLOR_BG,
+        Some(if is_url_focused { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    let url_display = if is_url_focused {
+        format!("{}|", modal.tracker_url)
+    } else {
+        modal.tracker_url.clone()
+    };
+    draw_text(
+        hdc,
+        &url_display,
+        url_x + 8,
+        url_y,
+        url_w - 16,
+        url_h,
+        fonts.small,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Custom Trackers row (modal_y + 126)
+    draw_text(
+        hdc,
+        "Custom Trackers (one per line):",
+        modal_x + 18,
+        modal_y + 126,
+        260,
+        18,
+        fonts.small_bold,
+        COLOR_TEXT_SECONDARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+    draw_text(
+        hdc,
+        "Appended to all torrents; original Nyaa and embedded trackers are always kept.",
+        modal_x + 18,
+        modal_y + 144,
+        modal_w - 36,
+        16,
+        fonts.small,
+        COLOR_TEXT_MUTED,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    let custom_box_x = modal_x + 18;
+    let custom_box_y = modal_y + 164;
+    let custom_box_w = modal_w - 36;
+    let footer_y = modal_y + modal_h - 44;
+    let custom_box_h = footer_y - custom_box_y - 10;
+    let is_custom_focused = modal.focused_field == TrackersFocusedField::Custom;
+
+    draw_rounded_rect(
+        hdc,
+        custom_box_x,
+        custom_box_y,
+        custom_box_w,
+        custom_box_h,
+        4,
+        COLOR_BG,
+        Some(if is_custom_focused { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+
+    let trimmed = modal.custom_text.trim();
+    if trimmed.is_empty() && !is_custom_focused {
+        let placeholder = "udp://tracker.opentrackr.org:1337/announce\nhttp://open.acgnxtracker.com:80/announce\n...";
+        let mut py = custom_box_y + 8;
+        for line in placeholder.lines() {
+            draw_text(
+                hdc,
+                line,
+                custom_box_x + 8,
+                py,
+                custom_box_w - 16,
+                18,
+                fonts.small,
+                COLOR_TEXT_MUTED,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            py += 18;
+        }
+    } else {
+        let lines: Vec<&str> = modal.custom_text.lines().collect();
+        let mut py = custom_box_y + 8;
+        let line_h = 18;
+        let max_visible_lines = ((custom_box_h - 16) / line_h).max(1) as usize;
+
+        let start_idx = if lines.len() > max_visible_lines {
+            lines.len() - max_visible_lines
+        } else {
+            0
+        };
+
+        for (i, line) in lines.iter().enumerate().skip(start_idx) {
+            if py + line_h > custom_box_y + custom_box_h - 4 {
+                break;
+            }
+            let is_last = i == lines.len().saturating_sub(1);
+            let line_text = if is_last && is_custom_focused {
+                format!("{line}|")
+            } else {
+                line.to_string()
+            };
+            draw_text(
+                hdc,
+                &line_text,
+                custom_box_x + 8,
+                py,
+                custom_box_w - 16,
+                line_h,
+                fonts.small,
+                COLOR_TEXT_PRIMARY,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            py += line_h;
+        }
+        if lines.is_empty() && is_custom_focused {
+            draw_text(
+                hdc,
+                "|",
+                custom_box_x + 8,
+                custom_box_y + 8,
+                custom_box_w - 16,
+                line_h,
+                fonts.small,
+                COLOR_TEXT_PRIMARY,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+    }
+
+    // Footer buttons
+    // Reset Defaults on left
+    let reset_w = 110;
+    let reset_h = 30;
+    let reset_x = modal_x + 18;
+    let reset_y = footer_y;
+    let is_reset_hover = state.hovered_control == Some(HoverControl::TrackersModalReset);
+    draw_rounded_rect(
+        hdc,
+        reset_x,
+        reset_y,
+        reset_w,
+        reset_h,
+        4,
+        if is_reset_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(COLOR_BORDER),
+    );
+    draw_text(
+        hdc,
+        "Reset Defaults",
+        reset_x,
+        reset_y,
+        reset_w,
+        reset_h,
+        fonts.regular,
+        if is_reset_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Cancel on right
+    let cancel_w = 70;
+    let cancel_h = 30;
+    let cancel_x = modal_x + modal_w - 18 - cancel_w;
+    let cancel_y = footer_y;
+    let is_cancel_hover = state.hovered_control == Some(HoverControl::TrackersModalClose);
+    draw_rounded_rect(
+        hdc,
+        cancel_x,
+        cancel_y,
+        cancel_w,
+        cancel_h,
+        4,
+        if is_cancel_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(COLOR_BORDER),
+    );
+    draw_text(
+        hdc,
+        "Cancel",
+        cancel_x,
+        cancel_y,
+        cancel_w,
+        cancel_h,
+        fonts.regular,
+        COLOR_TEXT_SECONDARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Save on right next to Cancel
+    let save_w = 80;
+    let save_h = 30;
+    let save_x = cancel_x - 10 - save_w;
+    let save_y = footer_y;
+    let is_save_hover = state.hovered_control == Some(HoverControl::TrackersModalSave);
+    draw_rounded_rect(
+        hdc,
+        save_x,
+        save_y,
+        save_w,
+        save_h,
+        4,
+        if is_save_hover { COLOR_ACCENT_HOVER } else { COLOR_ACCENT },
+        Some(COLOR_ACCENT_MUTED),
+    );
+    draw_text(
+        hdc,
+        "Save",
+        save_x,
+        save_y,
+        save_w,
+        save_h,
+        fonts.bold,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
 }
 
 fn render_tooltip(hdc: HDC, text: &str, tx: i32, ty: i32, fonts: &ThemeFonts) {

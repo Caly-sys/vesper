@@ -102,8 +102,46 @@ fn main() -> Result<()> {
     // 7. Initialize Layout A UI (Win32 child HWND, double-buffering, and dark frame)
     let mut ui = Box::new(VesperUi::new(&window, event_proxy.clone()));
     ui.state.download_dir = config.download_dir.clone();
+    ui.state.auto_sync_trackers = config.auto_sync_trackers;
+    ui.state.tracker_list_url = config.tracker_list_url.clone();
+    ui.state.custom_trackers = config.custom_trackers.clone();
+    ui.state.cached_remote_trackers = config.cached_remote_trackers.clone();
     ui.init_overlay();
     let video_hwnd = ui.video_hwnd();
+
+    // Initialize in-memory tracker pool with merged trackers
+    let initial_trackers = crate::stream::merge_trackers(&[], &config);
+    if let Some(engine) = torrent_engine.as_ref() {
+        engine.set_trackers(initial_trackers);
+    }
+
+    // Auto-sync public trackers on startup if enabled
+    if config.auto_sync_trackers {
+        let proxy = event_proxy.clone();
+        let tracker_url = config.tracker_list_url.clone();
+        runtime.spawn(async move {
+            match crate::stream::fetch_remote_trackers(&tracker_url).await {
+                Ok(fetched) => {
+                    info!("Auto-synced {} public trackers from {}", fetched.len(), tracker_url);
+                    let _ = proxy.send_event(AppEvent::TrackersSynced {
+                        count: fetched.len(),
+                        success: true,
+                        message: format!("Synced {} trackers", fetched.len()),
+                        fetched,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to auto-sync remote trackers: {e}");
+                    let _ = proxy.send_event(AppEvent::TrackersSynced {
+                        count: 0,
+                        success: false,
+                        message: format!("Sync failed: {e}"),
+                        fetched: Vec::new(),
+                    });
+                }
+            }
+        });
+    }
 
     // 8. Initialize MPV embedded player
     let mut player = match Player::new(video_hwnd, event_proxy.clone()) {
@@ -316,6 +354,18 @@ fn main() -> Result<()> {
                     }
 
                     AppEvent::CacheBuffering { .. } => {
+                        ui.handle_app_event(&app_event);
+                    }
+
+                    AppEvent::TrackersSynced { count: _, success, message: _, ref fetched } => {
+                        if success && !fetched.is_empty() {
+                            config.cached_remote_trackers = fetched.clone();
+                            let merged = crate::stream::merge_trackers(&[], &config);
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                engine.set_trackers(merged);
+                            }
+                            let _ = config.save();
+                        }
                         ui.handle_app_event(&app_event);
                     }
 
@@ -780,6 +830,55 @@ fn main() -> Result<()> {
                                     let _ = proxy.send_event(AppEvent::DownloadDirChanged(folder));
                                 }
                             });
+                        }
+
+                        UiAction::SyncTrackersNow(url) => {
+                            let proxy = event_proxy.clone();
+                            let target_url = url.clone();
+                            runtime.spawn(async move {
+                                match crate::stream::fetch_remote_trackers(&target_url).await {
+                                    Ok(fetched) => {
+                                        let _ = proxy.send_event(AppEvent::TrackersSynced {
+                                            count: fetched.len(),
+                                            success: true,
+                                            message: format!("Synced {} trackers", fetched.len()),
+                                            fetched,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = proxy.send_event(AppEvent::TrackersSynced {
+                                            count: 0,
+                                            success: false,
+                                            message: format!("Sync failed: {e}"),
+                                            fetched: Vec::new(),
+                                        });
+                                    }
+                                }
+                            });
+                        }
+
+                        UiAction::SaveTrackers { auto_sync, url, custom_trackers } => {
+                            config.auto_sync_trackers = auto_sync;
+                            config.tracker_list_url = url.clone();
+                            config.custom_trackers = custom_trackers.clone();
+                            let merged = crate::stream::merge_trackers(&[], &config);
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                engine.set_trackers(merged);
+                            }
+                            let _ = config.save();
+                            ui.state.auto_sync_trackers = auto_sync;
+                            ui.state.tracker_list_url = url;
+                            ui.state.custom_trackers = custom_trackers;
+                            ui.handle_app_event(&AppEvent::StatusMessage("Trackers configuration saved".to_string()));
+                        }
+
+                        UiAction::ResetTrackerDefaults => {
+                            config.auto_sync_trackers = true;
+                            config.tracker_list_url = crate::config::default_tracker_list_url();
+                            let _ = config.save();
+                            ui.state.auto_sync_trackers = true;
+                            ui.state.tracker_list_url = config.tracker_list_url.clone();
+                            ui.handle_app_event(&AppEvent::StatusMessage("Trackers reset to default".to_string()));
                         }
 
                         UiAction::CopyText(text) => {

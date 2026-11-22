@@ -27,7 +27,21 @@ pub struct VesperConfig {
 
     #[serde(default = "default_volume")]
     pub volume: f64,
+
+    #[serde(default = "default_auto_sync_trackers")]
+    pub auto_sync_trackers: bool,
+
+    #[serde(default = "default_tracker_list_url")]
+    pub tracker_list_url: String,
+
+    #[serde(default)]
+    pub custom_trackers: Vec<String>,
+
+    #[serde(default)]
+    pub cached_remote_trackers: Vec<String>,
 }
+
+pub type Config = VesperConfig;
 
 fn default_nyaa_base_url() -> String {
     "https://nyaa.si".to_string()
@@ -61,6 +75,14 @@ fn default_volume() -> f64 {
     100.0
 }
 
+pub fn default_auto_sync_trackers() -> bool {
+    true
+}
+
+pub fn default_tracker_list_url() -> String {
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".to_string()
+}
+
 impl Default for VesperConfig {
     fn default() -> Self {
         Self {
@@ -71,6 +93,10 @@ impl Default for VesperConfig {
             keep_streamed_files: default_keep_streamed_files(),
             default_sub_lang: default_sub_lang(),
             volume: default_volume(),
+            auto_sync_trackers: default_auto_sync_trackers(),
+            tracker_list_url: default_tracker_list_url(),
+            custom_trackers: Vec::new(),
+            cached_remote_trackers: Vec::new(),
         }
     }
 }
@@ -179,6 +205,10 @@ mod tests {
         assert!(config.cache_dir.ends_with("vesper-cache"));
         assert!(!config.keep_streamed_files);
         assert!(config.download_dir.ends_with("Vesper") || config.download_dir.ends_with("Vesper-Downloads"));
+        assert!(config.auto_sync_trackers);
+        assert!(config.tracker_list_url.contains("ngosang/trackerslist"));
+        assert!(config.custom_trackers.is_empty());
+        assert!(config.cached_remote_trackers.is_empty());
     }
 
     #[test]

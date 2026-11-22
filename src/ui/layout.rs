@@ -88,6 +88,7 @@ pub struct LayoutGeometry {
     pub nyaa_trusted_checkbox: Rect,
     pub nyaa_category_dropdown: Rect,
     pub stream_download_dir_btn: Rect,
+    pub stream_trackers_btn: Rect,
     pub nyaa_results_list: Rect,
 }
 
@@ -196,9 +197,11 @@ impl LayoutGeometry {
 
         let nyaa_trusted_checkbox = Rect::new(drawer_x + 12, 80, 95, 24);
         let nyaa_category_dropdown = Rect::new(nyaa_trusted_checkbox.right() + 6, 80, 90, 24);
-        let dl_dir_x = nyaa_category_dropdown.right() + 6;
-        let dl_dir_w = (drawer_x + drawer_w - 12 - dl_dir_x).max(40);
-        let stream_download_dir_btn = Rect::new(dl_dir_x, 80, dl_dir_w, 24);
+        let rem_x = nyaa_category_dropdown.right() + 6;
+        let rem_w = (drawer_x + drawer_w - 12 - rem_x).max(80);
+        let btn_w = ((rem_w - 6) / 2).max(35);
+        let stream_download_dir_btn = Rect::new(rem_x, 80, btn_w, 24);
+        let stream_trackers_btn = Rect::new(stream_download_dir_btn.right() + 6, 80, btn_w, 24);
 
         let nyaa_results_list = Rect::new(
             drawer_x,
@@ -244,6 +247,7 @@ impl LayoutGeometry {
             nyaa_trusted_checkbox,
             nyaa_category_dropdown,
             stream_download_dir_btn,
+            stream_trackers_btn,
             nyaa_results_list,
         }
     }
