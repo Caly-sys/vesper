@@ -14,7 +14,7 @@ Designed specifically for anime and media enthusiasts, Vesper combines zero-over
   - **Live Subtitle Stream:** Real-time timestamped subtitle cues with click-to-seek and one-click clipboard copying.
   - **Track Extraction:** Extract embedded `.ass`, `.srt`, or `.sup` (PGS) subtitle streams directly to disk without external tools.
   - **Folder Playlist:** Automatic sibling episode discovery and playlist management.
-  - **Direct URL Streaming:** Built-in stream client for HTTP, HTTPS, and HLS media feeds.
+  - **Network & Torrent Streaming:** Built-in stream and download client for RSS anime feeds, BitTorrent/Magnet URIs, and direct HTTP/HLS media feeds.
 - **Auto-Hiding Playback Bar:** Floating borderless Win32 overlay that docks above the viewport and automatically fades during playback after 2.5 seconds of mouse inactivity, preserving video aspect ratios with zero viewport resizing.
 - **Chapter Navigation & Drag-and-Drop:** Timeline tick markers for embedded MKV chapters, plus drag-and-drop support for local media files.
 

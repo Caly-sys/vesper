@@ -16,6 +16,12 @@ pub struct VesperConfig {
     #[serde(default = "default_auto_clean_cache")]
     pub auto_clean_cache: bool,
 
+    #[serde(default = "default_download_dir")]
+    pub download_dir: PathBuf,
+
+    #[serde(default = "default_keep_streamed_files")]
+    pub keep_streamed_files: bool,
+
     #[serde(default = "default_sub_lang")]
     pub default_sub_lang: String,
 
@@ -35,6 +41,18 @@ fn default_auto_clean_cache() -> bool {
     true
 }
 
+fn default_download_dir() -> PathBuf {
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        PathBuf::from(profile).join("Downloads").join("Vesper")
+    } else {
+        std::env::temp_dir().join("Vesper-Downloads")
+    }
+}
+
+fn default_keep_streamed_files() -> bool {
+    false
+}
+
 fn default_sub_lang() -> String {
     "eng".to_string()
 }
@@ -49,6 +67,8 @@ impl Default for VesperConfig {
             nyaa_base_url: default_nyaa_base_url(),
             cache_dir: default_cache_dir(),
             auto_clean_cache: default_auto_clean_cache(),
+            download_dir: default_download_dir(),
+            keep_streamed_files: default_keep_streamed_files(),
             default_sub_lang: default_sub_lang(),
             volume: default_volume(),
         }
@@ -157,6 +177,8 @@ mod tests {
         assert_eq!(config.volume, 100.0);
         assert!(config.auto_clean_cache);
         assert!(config.cache_dir.ends_with("vesper-cache"));
+        assert!(!config.keep_streamed_files);
+        assert!(config.download_dir.ends_with("Vesper") || config.download_dir.ends_with("Vesper-Downloads"));
     }
 
     #[test]

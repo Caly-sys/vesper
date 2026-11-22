@@ -3,29 +3,31 @@
 #[cfg(feature = "torrent")]
 mod inner {
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use librqbit::http_api::{HttpApi, HttpApiOptions};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ListenerOptions, Session, SessionOptions,
+    TorrentStatsState,
 };
 use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 
-use crate::types::{StreamStatus, TorrentFileInfo};
+use crate::types::{StreamStatus, TorrentDownloadItem, TorrentFileInfo, TorrentTaskState};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-struct ActiveStreamInfo {
-    torrent_id: usize,
-    file_idx: usize,
-    title: String,
-    file_rel_path: PathBuf,
-    file_len: u64,
+pub struct ManagedTaskInfo {
+    pub torrent_id: usize,
+    pub file_idx: Option<usize>,
+    pub title: String,
+    pub file_rel_path: Option<PathBuf>,
+    pub file_len: u64,
+    pub is_stream: bool,
+    pub dest_dir: PathBuf,
 }
 
 /// Embedded BitTorrent streaming engine utilizing `librqbit` and its internal HTTP API server.
@@ -35,19 +37,19 @@ pub struct TorrentEngine {
     session: Arc<Session>,
     api: Api,
     http_port: u16,
-    active_streams: Arc<RwLock<HashMap<usize, ActiveStreamInfo>>>,
+    tasks: Arc<RwLock<HashMap<usize, ManagedTaskInfo>>>,
 }
 
 impl TorrentEngine {
     /// Initialized with `cache_dir: std::path::PathBuf`, `auto_clean_on_exit: bool`.
-    ///
-    /// Spawns a `librqbit::Session` with `SessionOptions`, and starts the HTTP streaming
-    /// server on `127.0.0.1:0` (ephemeral port) so video streaming is immediately accessible.
     pub async fn new(cache_dir: PathBuf, auto_clean_on_exit: bool) -> Result<Self, String> {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("Failed to create torrent cache directory {:?}: {e}", cache_dir))?;
 
         let mut session_opts = SessionOptions::default();
+        if let Some(dht) = &mut session_opts.dht {
+            dht.persistence = None;
+        }
         session_opts.fastresume = true;
         session_opts.listen = Some(ListenerOptions {
             listen_addr: "0.0.0.0:0"
@@ -100,7 +102,7 @@ impl TorrentEngine {
             session,
             api,
             http_port,
-            active_streams: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -138,46 +140,40 @@ impl TorrentEngine {
         &self.session
     }
 
-    /// Adds a torrent via URL, magnet link, or bare 40-character infohash, discovers files,
-    /// and configures sequential streaming.
-    ///
-    /// - If single `.mkv` file: automatically picks it.
-    /// - If multiple `.mkv` files (batch torrent) and `selected_file_idx` is None: returns `StreamStatus::SelectingBatch { id, files }`.
-    /// - Once file index is selected: configures sequential streaming for that file index and returns `StreamStatus::Streaming { id, file_idx, title, port, ... }`.
+    /// Internal parser for adding torrents from magnet URIs, info hashes, file paths, or URLs
+    fn parse_torrent_input(input: &str) -> Result<AddTorrent<'static>, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err("Torrent target URL/hash cannot be empty".to_string());
+        }
+
+        let path = Path::new(trimmed);
+        if path.exists() && path.is_file() {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("Failed to read local torrent file {:?}: {e}", path))?;
+            return Ok(AddTorrent::from_bytes(bytes));
+        }
+
+        if (trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+            || (trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            return Ok(AddTorrent::from_url(format!("magnet:?xt=urn:btih:{}", trimmed)));
+        }
+
+        Ok(AddTorrent::from_url(trimmed.to_string()))
+    }
+
+    /// Adds a torrent via URL, magnet link, or local file for sequential streaming into temp cache
     pub async fn add_torrent_stream(
         &self,
         torrent_url_or_hash: &str,
         selected_file_idx: Option<usize>,
     ) -> Result<StreamStatus, String> {
-        let input = torrent_url_or_hash.trim();
-        if input.is_empty() {
-            return Err("Torrent target URL/hash cannot be empty".to_string());
-        }
-
-        let magnet_str;
-        let target = if input.starts_with("magnet:")
-            || input.starts_with("http://")
-            || input.starts_with("https://")
-        {
-            input
-        } else if input.len() == 40 && input.chars().all(|c| c.is_ascii_hexdigit()) {
-            magnet_str = format!("magnet:?xt=urn:btih:{}", input);
-            &magnet_str
-        } else if input.len() == 32 && input.chars().all(|c| c.is_ascii_alphanumeric()) {
-            magnet_str = format!("magnet:?xt=urn:btih:{}", input);
-            &magnet_str
-        } else {
-            input
-        };
-
-        debug!("Adding torrent stream with target: {target}");
-
-        let add = AddTorrent::from_cli_argument(target)
-            .or_else(|_| Ok::<_, anyhow::Error>(AddTorrent::from_url(target)))
-            .map_err(|e| format!("Failed to parse torrent input '{target}': {e}"))?;
+        let add = Self::parse_torrent_input(torrent_url_or_hash)?;
 
         let mut opts = AddTorrentOptions::default();
         opts.overwrite = true;
+        opts.output_folder = Some(self.cache_dir.to_string_lossy().to_string());
         if let Some(idx) = selected_file_idx {
             opts.only_files = Some(vec![idx]);
         }
@@ -196,15 +192,29 @@ impl TorrentEngine {
             }
         };
 
-        // Wait briefly for torrent metadata to resolve
-        let init_timeout = Duration::from_secs(15);
-        let _ = tokio::time::timeout(init_timeout, handle.wait_until_initialized()).await;
+        // Wait up to 10 seconds for initial metadata
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle.wait_until_initialized()).await;
 
         let metadata_arc = handle.metadata.load();
         let metadata = match metadata_arc.as_ref() {
             Some(m) => m,
             None => {
                 let title = handle.name().unwrap_or_else(|| format!("Torrent #{id}"));
+                {
+                    let mut tasks = self.tasks.write();
+                    tasks.insert(
+                        id,
+                        ManagedTaskInfo {
+                            torrent_id: id,
+                            file_idx: selected_file_idx,
+                            title: title.clone(),
+                            file_rel_path: None,
+                            file_len: 0,
+                            is_stream: true,
+                            dest_dir: self.cache_dir.clone(),
+                        },
+                    );
+                }
                 return Ok(StreamStatus::DownloadingMetadata { title });
             }
         };
@@ -219,7 +229,7 @@ impl TorrentEngine {
                 .relative_filename
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("mkv"))
+                .map(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("webm"))
                 .unwrap_or(false);
 
             let file_info = TorrentFileInfo {
@@ -239,23 +249,15 @@ impl TorrentEngine {
             return Err("Torrent contains no files".to_string());
         }
 
-        // Determine which file index to stream
         let file_idx = match selected_file_idx {
             Some(idx) => {
                 if idx >= metadata.file_infos.len() {
-                    return Err(format!(
-                        "Selected file index {idx} out of range (total files: {})",
-                        metadata.file_infos.len()
-                    ));
+                    return Err(format!("Selected file index {idx} out of range"));
                 }
                 idx
             }
             None => {
                 if mkv_files.len() > 1 {
-                    info!(
-                        "Discovered batch torrent #{id} with {} MKV files",
-                        mkv_files.len()
-                    );
                     return Ok(StreamStatus::SelectingBatch {
                         id,
                         files: mkv_files,
@@ -285,17 +287,18 @@ impl TorrentEngine {
         let file_rel_path = fi.relative_filename.clone();
         let file_len = fi.len;
 
-        // Store active stream metadata for status polling
         {
-            let mut streams = self.active_streams.write();
-            streams.insert(
+            let mut tasks = self.tasks.write();
+            tasks.insert(
                 id,
-                ActiveStreamInfo {
+                ManagedTaskInfo {
                     torrent_id: id,
-                    file_idx,
+                    file_idx: Some(file_idx),
                     title: title.clone(),
-                    file_rel_path: file_rel_path.clone(),
+                    file_rel_path: Some(file_rel_path.clone()),
                     file_len,
+                    is_stream: true,
+                    dest_dir: self.cache_dir.clone(),
                 },
             );
         }
@@ -329,7 +332,77 @@ impl TorrentEngine {
         })
     }
 
-    /// Checks download progress, piece completion, speed, and whether the torrent file has finished downloading.
+    /// Adds a torrent for full-speed background downloading into `dest_dir`
+    pub async fn add_torrent_download(
+        &self,
+        torrent_url_or_hash: &str,
+        dest_dir: &Path,
+        selected_file_idx: Option<usize>,
+    ) -> Result<usize, String> {
+        let _ = std::fs::create_dir_all(dest_dir);
+        let add = Self::parse_torrent_input(torrent_url_or_hash)?;
+
+        let mut opts = AddTorrentOptions::default();
+        opts.overwrite = true;
+        opts.output_folder = Some(dest_dir.to_string_lossy().to_string());
+        if let Some(idx) = selected_file_idx {
+            opts.only_files = Some(vec![idx]);
+        }
+
+        let add_response = self
+            .session
+            .add_torrent(add, Some(opts))
+            .await
+            .map_err(|e| format!("Failed to add download to session: {e}"))?;
+
+        let (id, handle) = match add_response {
+            AddTorrentResponse::Added(id, handle) => (id, handle),
+            AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
+            AddTorrentResponse::ListOnly(_) => {
+                return Err("Torrent was added in list-only mode".to_string());
+            }
+        };
+
+        let title = handle.name().unwrap_or_else(|| format!("Torrent #{id}"));
+        let metadata_arc = handle.metadata.load();
+
+        let (file_rel_path, file_len) = if let Some(m) = metadata_arc.as_ref() {
+            let total_len = m.file_infos.iter().map(|f| f.len).sum::<u64>();
+            if let Some(idx) = selected_file_idx {
+                if let Some(fi) = m.file_infos.get(idx) {
+                    (Some(fi.relative_filename.clone()), fi.len)
+                } else {
+                    (None, total_len)
+                }
+            } else if m.file_infos.len() == 1 {
+                (Some(m.file_infos[0].relative_filename.clone()), m.file_infos[0].len)
+            } else {
+                (None, total_len)
+            }
+        } else {
+            (None, 0)
+        };
+
+        {
+            let mut tasks = self.tasks.write();
+            tasks.insert(
+                id,
+                ManagedTaskInfo {
+                    torrent_id: id,
+                    file_idx: selected_file_idx,
+                    title,
+                    file_rel_path,
+                    file_len,
+                    is_stream: false,
+                    dest_dir: dest_dir.to_path_buf(),
+                },
+            );
+        }
+
+        Ok(id)
+    }
+
+    /// Checks status for active stream playback
     pub fn poll_status(&self, torrent_id: usize) -> StreamStatus {
         let handle = match self.session.get(torrent_id.into()) {
             Some(h) => h,
@@ -354,18 +427,17 @@ impl TorrentEngine {
             }
         };
 
-        let streams = self.active_streams.read();
-        let active = match streams.get(&torrent_id) {
+        let tasks = self.tasks.read();
+        let active = match tasks.get(&torrent_id) {
             Some(a) => a,
             None => {
-                // If no active file index was selected yet, return batch selection list
                 let mut mkv_files = Vec::new();
                 for (idx, fi) in metadata.file_infos.iter().enumerate() {
                     let is_mkv = fi
                         .relative_filename
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("mkv"))
+                        .map(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("webm"))
                         .unwrap_or(false);
                     if is_mkv {
                         mkv_files.push(TorrentFileInfo {
@@ -383,8 +455,8 @@ impl TorrentEngine {
             }
         };
 
-        let (is_complete, progress_pct) =
-            compute_file_progress(&stats, active.file_idx, active.file_len);
+        let file_idx = active.file_idx.unwrap_or(0);
+        let (is_complete, progress_pct) = compute_file_progress(&stats, file_idx, active.file_len);
         let speed_bytes = stats
             .live
             .as_ref()
@@ -392,18 +464,20 @@ impl TorrentEngine {
             .unwrap_or(0);
 
         if is_complete {
-            let full_path = handle.output_folder().join(&active.file_rel_path);
-            if full_path.exists() {
-                return StreamStatus::Completed {
-                    file_path: full_path,
-                    title: active.title.clone(),
-                };
+            if let Some(ref rel) = active.file_rel_path {
+                let full_path = handle.output_folder().join(rel);
+                if full_path.exists() {
+                    return StreamStatus::Completed {
+                        file_path: full_path,
+                        title: active.title.clone(),
+                    };
+                }
             }
         }
 
         StreamStatus::Streaming {
             id: torrent_id,
-            file_idx: active.file_idx,
+            file_idx,
             title: active.title.clone(),
             port: self.http_port,
             progress_pct,
@@ -412,18 +486,145 @@ impl TorrentEngine {
         }
     }
 
-    /// Performs clean shutdown and removes temporary cache files if `auto_clean_on_exit` is enabled.
+    /// Query and snapshot all active and completed torrent downloads for the UI
+    pub fn poll_all_tasks(&self) -> Vec<TorrentDownloadItem> {
+        let tasks = self.tasks.read().clone();
+        let mut results = Vec::new();
+
+        for (id, mut task) in tasks {
+            let handle = match self.session.get(id.into()) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            let stats = handle.stats();
+            let metadata_arc = handle.metadata.load();
+
+            // Lazy resolution of metadata if it was resolving
+            if task.file_rel_path.is_none() {
+                if let Some(m) = metadata_arc.as_ref() {
+                    let total_len = m.file_infos.iter().map(|f| f.len).sum::<u64>();
+                    let (rel, len) = if let Some(idx) = task.file_idx {
+                        if let Some(fi) = m.file_infos.get(idx) {
+                            (Some(fi.relative_filename.clone()), fi.len)
+                        } else {
+                            (None, total_len)
+                        }
+                    } else if m.file_infos.len() == 1 {
+                        (Some(m.file_infos[0].relative_filename.clone()), m.file_infos[0].len)
+                    } else {
+                        (None, total_len)
+                    };
+                    task.file_rel_path = rel;
+                    task.file_len = len;
+                    task.title = handle.name().unwrap_or(task.title);
+                }
+            }
+
+            let speed_bytes = stats
+                .live
+                .as_ref()
+                .map(|l| l.download_speed.as_bytes())
+                .unwrap_or(0);
+
+            let peer_count = stats
+                .live
+                .as_ref()
+                .map(|l| l.snapshot.peer_stats.live as usize)
+                .unwrap_or(0);
+
+            let (is_complete, pct) = if let Some(idx) = task.file_idx {
+                compute_file_progress(&stats, idx, task.file_len)
+            } else if stats.total_bytes > 0 {
+                let p = (stats.progress_bytes as f32 / stats.total_bytes as f32) * 100.0;
+                (stats.finished || stats.progress_bytes >= stats.total_bytes, p.min(100.0))
+            } else {
+                (false, 0.0)
+            };
+
+            let state = if let Some(ref err) = stats.error {
+                TorrentTaskState::Error(err.clone())
+            } else if matches!(stats.state, TorrentStatsState::Paused) {
+                TorrentTaskState::Paused
+            } else if metadata_arc.is_none() {
+                TorrentTaskState::Resolving
+            } else if is_complete {
+                TorrentTaskState::Completed
+            } else {
+                TorrentTaskState::Downloading
+            };
+
+            let (downloaded_bytes, total_bytes) = if let Some(idx) = task.file_idx {
+                let dl = stats.file_progress.get(idx).copied().unwrap_or(0);
+                (dl, task.file_len)
+            } else {
+                (stats.progress_bytes, stats.total_bytes)
+            };
+
+            let output_path = if let Some(ref rel) = task.file_rel_path {
+                handle.output_folder().join(rel)
+            } else {
+                handle.output_folder().to_path_buf()
+            };
+
+            results.push(TorrentDownloadItem {
+                id,
+                name: task.title,
+                downloaded_bytes,
+                total_bytes,
+                progress_pct: pct,
+                speed_bytes,
+                peer_count,
+                state,
+                is_stream: task.is_stream,
+                output_path,
+            });
+        }
+
+        results.sort_by_key(|t| t.id);
+        results
+    }
+
+    /// Pause downloading or seeding a torrent
+    pub async fn pause_torrent(&self, id: usize) -> Result<(), String> {
+        self.api
+            .api_torrent_action_pause(id.into())
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to pause torrent #{id}: {e}"))
+    }
+
+    /// Resume downloading a torrent
+    pub async fn resume_torrent(&self, id: usize) -> Result<(), String> {
+        self.api
+            .api_torrent_action_start(id.into())
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to resume torrent #{id}: {e}"))
+    }
+
+    /// Remove a torrent from session and optionally delete downloaded data
+    pub async fn cancel_torrent(&self, id: usize, delete_files: bool) -> Result<(), String> {
+        let res = if delete_files {
+            self.api.api_torrent_action_delete(id.into()).await
+        } else {
+            self.api.api_torrent_action_forget(id.into()).await
+        };
+
+        {
+            let mut tasks = self.tasks.write();
+            tasks.remove(&id);
+        }
+
+        res.map(|_| ()).map_err(|e| format!("Failed to remove torrent #{id}: {e}"))
+    }
+
+    /// Performs clean shutdown and removes temporary cache files if `auto_clean_on_exit` is enabled
     pub fn cleanup(&self) {
         if self.auto_clean_on_exit && self.cache_dir.exists() {
-            info!(
-                "Cleaning up torrent cache directory on shutdown: {:?}",
-                self.cache_dir
-            );
+            info!("Cleaning up torrent cache directory on shutdown: {:?}", self.cache_dir);
             if let Err(e) = std::fs::remove_dir_all(&self.cache_dir) {
-                warn!(
-                    "Failed to remove torrent cache directory {:?}: {e}",
-                    self.cache_dir
-                );
+                warn!("Failed to remove torrent cache directory {:?}: {e}", self.cache_dir);
             }
         }
     }
@@ -509,13 +710,8 @@ mod tests {
         let url = engine.get_stream_url(42, 3);
         assert_eq!(url, format!("http://127.0.0.1:{port}/torrents/42/stream/3"));
 
-        let status = engine.poll_status(9999);
-        match status {
-            StreamStatus::Error(msg) => {
-                assert!(msg.contains("not found"));
-            }
-            other => panic!("Expected StreamStatus::Error, got {:?}", other),
-        }
+        let tasks = engine.poll_all_tasks();
+        assert!(tasks.is_empty());
 
         engine.cleanup();
         assert!(
@@ -539,8 +735,8 @@ pub use inner::*;
 
 #[cfg(not(feature = "torrent"))]
 mod stub {
-    use std::path::PathBuf;
-    use crate::types::StreamStatus;
+    use std::path::{Path, PathBuf};
+    use crate::types::{StreamStatus, TorrentDownloadItem};
 
     pub struct TorrentEngine;
 
@@ -553,12 +749,41 @@ mod stub {
             0
         }
 
-        pub async fn add_torrent_stream(&self, _torrent_input: &str, _file_idx: Option<usize>) -> Result<StreamStatus, String> {
+        pub async fn add_torrent_stream(
+            &self,
+            _torrent_input: &str,
+            _file_idx: Option<usize>,
+        ) -> Result<StreamStatus, String> {
             Err("Torrent streaming requires compiling with '--features torrent'".to_string())
+        }
+
+        pub async fn add_torrent_download(
+            &self,
+            _torrent_input: &str,
+            _dest_dir: &Path,
+            _file_idx: Option<usize>,
+        ) -> Result<usize, String> {
+            Err("Torrent downloading requires compiling with '--features torrent'".to_string())
         }
 
         pub fn poll_status(&self, _torrent_id: usize) -> StreamStatus {
             StreamStatus::Idle
+        }
+
+        pub fn poll_all_tasks(&self) -> Vec<TorrentDownloadItem> {
+            Vec::new()
+        }
+
+        pub async fn pause_torrent(&self, _id: usize) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub async fn resume_torrent(&self, _id: usize) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub async fn cancel_torrent(&self, _id: usize, _delete_files: bool) -> Result<(), String> {
+            Ok(())
         }
 
         pub fn get_stream_url(&self, _torrent_id: usize, _file_idx: usize) -> String {
@@ -577,10 +802,11 @@ mod stub {
             let engine = TorrentEngine::new(PathBuf::from("dummy"), false).await.unwrap();
             assert_eq!(engine.http_port(), 0);
             assert!(engine.add_torrent_stream("test", None).await.is_err());
+            assert!(engine.add_torrent_download("test", Path::new("."), None).await.is_err());
+            assert!(engine.poll_all_tasks().is_empty());
         }
     }
 }
 
 #[cfg(not(feature = "torrent"))]
 pub use stub::*;
-

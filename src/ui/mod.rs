@@ -67,6 +67,24 @@ pub enum UiAction {
         file_idx: usize,
     },
     ToggleFullscreen,
+    StartTorrentStream {
+        source: String,
+        title: String,
+    },
+    StartTorrentDownload {
+        source: String,
+        title: String,
+    },
+    PauseTorrent(usize),
+    ResumeTorrent(usize),
+    CancelTorrent {
+        id: usize,
+        delete_files: bool,
+    },
+    OpenTorrentFolder(PathBuf),
+    ChangeDownloadDir,
+    CopyText(String),
+    OpenExternal(String),
 }
 
 unsafe extern "system" fn video_host_wndproc(
@@ -675,6 +693,26 @@ impl VesperUi {
 
             WindowEvent::DroppedFile(path) => {
                 let p = path.clone();
+                if crate::stream::is_torrent_file(&p) {
+                    let filename = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Torrent")
+                        .to_string();
+                    if cfg!(feature = "torrent") {
+                        self.action_queue.push_back(UiAction::StartTorrentStream {
+                            source: p.to_string_lossy().to_string(),
+                            title: filename,
+                        });
+                        self.state.active_tab = Tab::Nyaa;
+                    } else {
+                        self.action_queue
+                            .push_back(UiAction::OpenExternal(p.to_string_lossy().to_string()));
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+
                 self.set_video_visible(true);
                 let filename = p
                     .file_name()
@@ -1017,6 +1055,31 @@ impl VesperUi {
                 self.request_redraw();
             }
 
+            AppEvent::TorrentDownloadsUpdated(downloads) => {
+                self.state.downloads = downloads.clone();
+                self.request_redraw();
+            }
+
+            AppEvent::DownloadCompleted(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Download")
+                    .to_string();
+                self.state.status_message =
+                    Some((format!("Download completed: {}", name), Instant::now()));
+                self.request_redraw();
+            }
+
+            AppEvent::DownloadDirChanged(dir) => {
+                self.state.download_dir = dir.clone();
+                self.state.status_message = Some((
+                    format!("Download folder: {}", dir.display()),
+                    Instant::now(),
+                ));
+                self.request_redraw();
+            }
+
             AppEvent::SubtitleExtracted { track_name, path } => {
                 self.state.status_message = Some((
                     format!("Extracted: {} to {:?}", track_name, path),
@@ -1346,23 +1409,107 @@ impl VesperUi {
                             new_hover = Some(HoverControl::NyaaTrustedCheckbox);
                         } else if self.geom.nyaa_category_dropdown.contains(px, py) {
                             new_hover = Some(HoverControl::NyaaCategoryDropdown);
+                        } else if self.geom.stream_download_dir_btn.contains(px, py) {
+                            new_hover = Some(HoverControl::StreamFolderPicker);
+                            new_tooltip = Some((
+                                format!("Download folder: {}", self.state.download_dir.display()),
+                                px,
+                                self.geom.stream_download_dir_btn.bottom() + 4,
+                            ));
                         } else if self.geom.nyaa_results_list.contains(px, py) {
-                            let item_h = 68;
-                            let item_margin = 6;
                             let mut y =
                                 self.geom.nyaa_results_list.y + 4 - self.state.nyaa_scroll_y;
-                            for (idx, _) in self.state.nyaa_results.iter().enumerate() {
-                                let row_r = Rect::new(
-                                    self.geom.nyaa_results_list.x + 12,
-                                    y,
-                                    self.geom.nyaa_results_list.w - 24,
-                                    item_h,
-                                );
-                                if row_r.contains(px, py) {
-                                    new_hover = Some(HoverControl::NyaaResult(idx));
-                                    break;
+
+                            // Downloads section hit test
+                            if !self.state.downloads.is_empty() {
+                                y += 22;
+                                for (idx, dl) in self.state.downloads.iter().enumerate() {
+                                    let card_h = 68;
+                                    let card_r = Rect::new(
+                                        self.geom.nyaa_results_list.x + 12,
+                                        y,
+                                        self.geom.nyaa_results_list.w - 24,
+                                        card_h,
+                                    );
+                                    if card_r.contains(px, py) {
+                                        let btn_y = card_r.y + 38;
+                                        let btn_h = 22;
+                                        let is_complete =
+                                            matches!(dl.state, crate::types::TorrentTaskState::Completed);
+
+                                        let rem_x = card_r.x + card_r.w - 10 - 24;
+                                        let fol_x = rem_x - 6 - 48;
+                                        let act_btn_w = if is_complete { 44 } else { 50 };
+                                        let act_x = fol_x - 6 - act_btn_w;
+
+                                        if Rect::new(rem_x, btn_y, 24, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadRemove(idx));
+                                        } else if Rect::new(fol_x, btn_y, 48, btn_h).contains(px, py) {
+                                            new_hover = Some(HoverControl::DownloadFolder(idx));
+                                        } else if Rect::new(act_x, btn_y, act_btn_w, btn_h).contains(px, py) {
+                                            new_hover = Some(if is_complete {
+                                                HoverControl::DownloadPlay(idx)
+                                            } else {
+                                                HoverControl::DownloadPauseResume(idx)
+                                            });
+                                        } else {
+                                            new_hover = Some(HoverControl::DownloadCard(idx));
+                                        }
+                                        break;
+                                    }
+                                    y += card_h + 6;
                                 }
-                                y += item_h + item_margin;
+                                y += 6;
+                            }
+
+                            // Search results section hit test
+                            if new_hover.is_none() && !self.state.nyaa_results.is_empty() {
+                                if !self.state.downloads.is_empty() {
+                                    y += 22;
+                                }
+                                let item_h = 72;
+                                let item_margin = 6;
+                                for (idx, _) in self.state.nyaa_results.iter().enumerate() {
+                                    let row_r = Rect::new(
+                                        self.geom.nyaa_results_list.x + 12,
+                                        y,
+                                        self.geom.nyaa_results_list.w - 24,
+                                        item_h,
+                                    );
+                                    if row_r.contains(px, py) {
+                                        let btn_y = row_r.y + 38;
+                                        let btn_h = 22;
+
+                                        if cfg!(feature = "torrent") {
+                                            let copy_x = row_r.x + row_r.w - 10 - 40;
+                                            let dl_x = copy_x - 6 - 58;
+                                            let stream_x = dl_x - 6 - 50;
+
+                                            if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
+                                                new_hover = Some(HoverControl::NyaaResultCopyMagnet(idx));
+                                            } else if Rect::new(dl_x, btn_y, 58, btn_h).contains(px, py) {
+                                                new_hover = Some(HoverControl::NyaaResultDownload(idx));
+                                            } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
+                                                new_hover = Some(HoverControl::NyaaResultStream(idx));
+                                            } else {
+                                                new_hover = Some(HoverControl::NyaaResult(idx));
+                                            }
+                                        } else {
+                                            let copy_x = row_r.x + row_r.w - 10 - 40;
+                                            let open_x = copy_x - 6 - 76;
+
+                                            if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
+                                                new_hover = Some(HoverControl::NyaaResultCopyMagnet(idx));
+                                            } else if Rect::new(open_x, btn_y, 76, btn_h).contains(px, py) {
+                                                new_hover = Some(HoverControl::NyaaResultOpenMagnet(idx));
+                                            } else {
+                                                new_hover = Some(HoverControl::NyaaResult(idx));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    y += item_h + item_margin;
+                                }
                             }
                         }
                     }
@@ -1760,25 +1907,139 @@ impl VesperUi {
                         return true;
                     }
 
+                    if self.geom.stream_download_dir_btn.contains(px, py) {
+                        self.action_queue.push_back(UiAction::ChangeDownloadDir);
+                        return true;
+                    }
+
                     if self.geom.nyaa_results_list.contains(px, py) {
-                        let item_h = 68;
-                        let item_margin = 6;
                         let mut y =
                             self.geom.nyaa_results_list.y + 4 - self.state.nyaa_scroll_y;
-                        for (_idx, item) in self.state.nyaa_results.iter().enumerate() {
-                            let row_r = Rect::new(
-                                self.geom.nyaa_results_list.x + 12,
-                                y,
-                                self.geom.nyaa_results_list.w - 24,
-                                item_h,
-                            );
-                            if row_r.contains(px, py) {
-                                // Stream torrent result or handle batch
-                                self.action_queue
-                                    .push_back(UiAction::StreamNyaa(item.clone()));
-                                return true;
+
+                        // Downloads section
+                        if !self.state.downloads.is_empty() {
+                            y += 22;
+                            for (_idx, dl) in self.state.downloads.iter().enumerate() {
+                                let card_h = 68;
+                                let card_r = Rect::new(
+                                    self.geom.nyaa_results_list.x + 12,
+                                    y,
+                                    self.geom.nyaa_results_list.w - 24,
+                                    card_h,
+                                );
+                                if card_r.contains(px, py) {
+                                    let btn_y = card_r.y + 38;
+                                    let btn_h = 22;
+                                    let is_complete =
+                                        matches!(dl.state, crate::types::TorrentTaskState::Completed);
+
+                                    let rem_x = card_r.x + card_r.w - 10 - 24;
+                                    let fol_x = rem_x - 6 - 48;
+                                    let act_btn_w = if is_complete { 44 } else { 50 };
+                                    let act_x = fol_x - 6 - act_btn_w;
+
+                                    if Rect::new(rem_x, btn_y, 24, btn_h).contains(px, py) {
+                                        self.action_queue.push_back(UiAction::CancelTorrent {
+                                            id: dl.id,
+                                            delete_files: false,
+                                        });
+                                        return true;
+                                    } else if Rect::new(fol_x, btn_y, 48, btn_h).contains(px, py) {
+                                        self.action_queue
+                                            .push_back(UiAction::OpenTorrentFolder(dl.output_path.clone()));
+                                        return true;
+                                    } else if Rect::new(act_x, btn_y, act_btn_w, btn_h).contains(px, py) {
+                                        if is_complete {
+                                            if dl.output_path.exists() {
+                                                self.action_queue
+                                                    .push_back(UiAction::LoadFile(dl.output_path.clone()));
+                                                self.action_queue.push_back(UiAction::Player(
+                                                    PlayerCommand::Load(dl.output_path.display().to_string()),
+                                                ));
+                                            }
+                                        } else if matches!(dl.state, crate::types::TorrentTaskState::Paused) {
+                                            self.action_queue.push_back(UiAction::ResumeTorrent(dl.id));
+                                        } else {
+                                            self.action_queue.push_back(UiAction::PauseTorrent(dl.id));
+                                        }
+                                        return true;
+                                    }
+                                    return true;
+                                }
+                                y += card_h + 6;
                             }
-                            y += item_h + item_margin;
+                            y += 6;
+                        }
+
+                        // Search results section
+                        if !self.state.nyaa_results.is_empty() {
+                            if !self.state.downloads.is_empty() {
+                                y += 22;
+                            }
+                            let item_h = 72;
+                            let item_margin = 6;
+                            for (_idx, item) in self.state.nyaa_results.iter().enumerate() {
+                                let row_r = Rect::new(
+                                    self.geom.nyaa_results_list.x + 12,
+                                    y,
+                                    self.geom.nyaa_results_list.w - 24,
+                                    item_h,
+                                );
+                                if row_r.contains(px, py) {
+                                    let btn_y = row_r.y + 38;
+                                    let btn_h = 22;
+
+                                    if cfg!(feature = "torrent") {
+                                        let copy_x = row_r.x + row_r.w - 10 - 40;
+                                        let dl_x = copy_x - 6 - 58;
+                                        let stream_x = dl_x - 6 - 50;
+
+                                        if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
+                                            let magnet =
+                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            self.action_queue.push_back(UiAction::CopyText(magnet));
+                                            return true;
+                                        } else if Rect::new(dl_x, btn_y, 58, btn_h).contains(px, py) {
+                                            let source =
+                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            self.action_queue.push_back(UiAction::StartTorrentDownload {
+                                                source,
+                                                title: item.clean_title.clone(),
+                                            });
+                                            return true;
+                                        } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
+                                            self.action_queue
+                                                .push_back(UiAction::StreamNyaa(item.clone()));
+                                            return true;
+                                        } else {
+                                            self.action_queue
+                                                .push_back(UiAction::StreamNyaa(item.clone()));
+                                            return true;
+                                        }
+                                    } else {
+                                        let copy_x = row_r.x + row_r.w - 10 - 40;
+                                        let open_x = copy_x - 6 - 76;
+
+                                        if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
+                                            let magnet =
+                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            self.action_queue.push_back(UiAction::CopyText(magnet));
+                                            return true;
+                                        } else if Rect::new(open_x, btn_y, 76, btn_h).contains(px, py) {
+                                            let magnet =
+                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            self.action_queue.push_back(UiAction::OpenExternal(magnet));
+                                            return true;
+                                        } else {
+                                            let magnet =
+                                                item.magnet_uri().unwrap_or_else(|| item.link.clone());
+                                            self.action_queue.push_back(UiAction::OpenExternal(magnet));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                y += item_h + item_margin;
+                            }
                         }
                     }
                 }
@@ -1910,11 +2171,8 @@ impl VesperUi {
     fn trigger_nyaa_search(&mut self) {
         let q = self.state.search_query.trim().to_string();
         if !q.is_empty() {
-            // Direct HTTP/HTTPS/HLS stream URL pasted into search/stream box
-            if (q.starts_with("http://") || q.starts_with("https://"))
-                && !q.contains(".torrent")
-                && !q.contains("magnet:")
-            {
+            // 1. Direct HTTP/HTTPS/HLS stream URL pasted into search/stream box
+            if crate::stream::is_direct_stream_url(&q) {
                 self.action_queue
                     .push_back(UiAction::Player(PlayerCommand::Load(q.clone())));
                 self.set_video_visible(true);
@@ -1923,6 +2181,30 @@ impl VesperUi {
                 self.state.media_title = q.clone();
                 self.state.cues.clear();
                 self.set_title(&q);
+                self.request_redraw();
+                return;
+            }
+
+            // 2. Magnet URI or .torrent URL
+            if crate::stream::is_magnet(&q) || crate::stream::is_torrent_url(&q) {
+                self.state.search_focused = false;
+                let title = if let Some(dn) = q.split("&dn=").nth(1) {
+                    let end = dn.find('&').unwrap_or(dn.len());
+                    urlencoding::decode(&dn[..end])
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    "Pasted Stream".to_string()
+                };
+
+                if cfg!(feature = "torrent") {
+                    self.action_queue.push_back(UiAction::StartTorrentStream {
+                        source: q.clone(),
+                        title,
+                    });
+                } else {
+                    self.action_queue.push_back(UiAction::OpenExternal(q.clone()));
+                }
                 self.request_redraw();
                 return;
             }

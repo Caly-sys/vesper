@@ -70,6 +70,14 @@ pub struct NyaaItem {
     pub date: String,
 }
 
+impl NyaaItem {
+    pub fn magnet_uri(&self) -> Option<String> {
+        self.info_hash
+            .as_ref()
+            .map(|hash| crate::stream::build_magnet_uri(hash, &self.title))
+    }
+}
+
 /// Filter for Nyaa searches
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NyaaFilter {
@@ -94,6 +102,31 @@ impl NyaaCategory {
             Self::AnimeRaw => "1_4",
         }
     }
+}
+
+/// State of a managed torrent download/stream task
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TorrentTaskState {
+    Resolving,
+    Downloading,
+    Paused,
+    Completed,
+    Error(String),
+}
+
+/// Download/stream task item tracked by TorrentEngine and UI
+#[derive(Debug, Clone, PartialEq)]
+pub struct TorrentDownloadItem {
+    pub id: usize,
+    pub name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub progress_pct: f32,
+    pub speed_bytes: u64,
+    pub peer_count: usize,
+    pub state: TorrentTaskState,
+    pub is_stream: bool,
+    pub output_path: PathBuf,
 }
 
 /// Detailed file info inside a torrent
@@ -175,6 +208,12 @@ pub enum AppEvent {
     NyaaSearchError(String),
     /// Stream status update
     TorrentStatusChanged(StreamStatus),
+    /// Active / completed torrent downloads list updated
+    TorrentDownloadsUpdated(Vec<TorrentDownloadItem>),
+    /// Download reached 100% completion
+    DownloadCompleted(PathBuf),
+    /// Download destination directory changed
+    DownloadDirChanged(PathBuf),
     /// Batch torrent file list ready for user selection
     TorrentBatchDiscovered { id: usize, files: Vec<TorrentFileInfo> },
     /// Subtitle track extraction succeeded

@@ -4,11 +4,13 @@ mod config;
 mod episodes;
 mod nyaa;
 mod player;
+mod stream;
 mod subtitles;
 mod torrent;
 mod types;
 mod ui;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +25,7 @@ use crate::config::VesperConfig;
 use crate::player::Player;
 use crate::subtitles::{extract_subtitle_track, SubCueBuffer};
 use crate::torrent::TorrentEngine;
-use crate::types::{AppEvent, StreamStatus};
+use crate::types::{AppEvent, StreamStatus, TorrentTaskState};
 use crate::ui::controls::Tab;
 use crate::ui::{UiAction, VesperUi};
 
@@ -97,6 +99,7 @@ fn main() -> Result<()> {
 
     // 7. Initialize Layout A UI (Win32 child HWND, double-buffering, and dark frame)
     let mut ui = Box::new(VesperUi::new(&window, event_proxy.clone()));
+    ui.state.download_dir = config.download_dir.clone();
     ui.init_overlay();
     let video_hwnd = ui.video_hwnd();
 
@@ -119,6 +122,7 @@ fn main() -> Result<()> {
     // 9. Runtime state trackers
     let mut current_file_path: Option<PathBuf> = None;
     let mut active_torrent_id: Option<usize> = None;
+    let mut completed_torrents: HashSet<usize> = HashSet::new();
     let mut cue_buffer = SubCueBuffer::new();
     let mut is_fullscreen = false;
     let mut last_torrent_poll = Instant::now();
@@ -152,17 +156,31 @@ fn main() -> Result<()> {
 
     // 10. Run main Event Loop with dynamic ControlFlow
     event_loop.run(move |event, elwt| {
-        if ui.is_video_playing() {
-            elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(50)));
+        let has_active_downloads = ui
+            .state
+            .downloads
+            .iter()
+            .any(|d| matches!(d.state, TorrentTaskState::Downloading | TorrentTaskState::Resolving));
+        if ui.is_video_playing() || has_active_downloads {
+            elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
         } else {
             elwt.set_control_flow(ControlFlow::Wait);
         }
 
-        // Periodic background poll for torrent streaming progress (every 500ms)
-        if let Some(torrent_id) = active_torrent_id {
-            if last_torrent_poll.elapsed() >= Duration::from_millis(500) {
-                last_torrent_poll = Instant::now();
-                if let Some(engine) = torrent_engine.as_ref() {
+        // Periodic background poll for torrent streaming progress and active tasks (every 500ms)
+        if last_torrent_poll.elapsed() >= Duration::from_millis(500) {
+            last_torrent_poll = Instant::now();
+            if let Some(engine) = torrent_engine.as_ref() {
+                let downloads = engine.poll_all_tasks();
+                for dl in &downloads {
+                    if matches!(dl.state, TorrentTaskState::Completed) && !completed_torrents.contains(&dl.id) {
+                        completed_torrents.insert(dl.id);
+                        let _ = event_proxy.send_event(AppEvent::DownloadCompleted(dl.output_path.clone()));
+                    }
+                }
+                ui.handle_app_event(&AppEvent::TorrentDownloadsUpdated(downloads));
+
+                if let Some(torrent_id) = active_torrent_id {
                     let status = engine.poll_status(torrent_id);
                     ui.handle_app_event(&AppEvent::TorrentStatusChanged(status.clone()));
 
@@ -256,6 +274,7 @@ fn main() -> Result<()> {
                     | AppEvent::NyaaResultsLoaded(_)
                     | AppEvent::NyaaSearchError(_)
                     | AppEvent::TorrentBatchDiscovered { .. }
+                    | AppEvent::TorrentDownloadsUpdated(_)
                     | AppEvent::SubtitleExtracted { .. }
                     | AppEvent::SubtitleExtractionError(_)
                     | AppEvent::StatusMessage(_) => {
@@ -318,6 +337,29 @@ fn main() -> Result<()> {
                             ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
                         }
                         ui.handle_app_event(&AppEvent::FileLoaded { title, duration, path });
+                    }
+
+                    AppEvent::DownloadCompleted(ref path) => {
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Media");
+                        info!("Torrent task completed: {filename} ({})", path.display());
+                        if let Some(ref cur) = current_file_path {
+                            if let (Some(cur_dir), Some(dl_dir)) = (cur.parent(), path.parent()) {
+                                if cur_dir == dl_dir {
+                                    let siblings = episodes::scan_sibling_episodes(cur);
+                                    ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
+                                }
+                            }
+                        }
+                        ui.handle_app_event(&AppEvent::DownloadCompleted(path.clone()));
+                    }
+
+                    AppEvent::DownloadDirChanged(ref folder) => {
+                        config.download_dir = folder.clone();
+                        let _ = config.save();
+                        ui.handle_app_event(&AppEvent::DownloadDirChanged(folder.clone()));
                     }
                 }
 
@@ -432,12 +474,9 @@ fn main() -> Result<()> {
                         }
 
                         UiAction::StreamNyaa(item) => {
-                            let link = item.link.clone();
+                            let link = item.magnet_uri().unwrap_or_else(|| item.link.clone());
                             // Direct HTTP/HTTPS/HLS stream URL (e.g. mp4, mkv, m3u8)
-                            if (link.starts_with("http://") || link.starts_with("https://"))
-                                && !link.contains(".torrent")
-                                && !link.contains("magnet:")
-                            {
+                            if crate::stream::is_direct_stream_url(&link) {
                                 info!("Direct HTTP/HTTPS stream URL detected: {link}");
                                 if let Some(p) = player.as_mut() {
                                     let _ = p.load(&link);
@@ -477,10 +516,125 @@ fn main() -> Result<()> {
                                     }
                                 });
                             } else {
+                                let _ = crate::stream::open_external(&link);
                                 ui.handle_app_event(&AppEvent::StatusMessage(
-                                    "Torrent streaming requires building with '--features torrent'. Direct HTTP/HTTPS streams supported.".to_string(),
+                                    "Opened in external torrent client".to_string(),
                                 ));
                             }
+                        }
+
+                        UiAction::StartTorrentStream { source, title } => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine = engine.clone();
+                                let proxy = event_proxy.clone();
+                                info!("Starting torrent stream: {title} ({source})");
+
+                                runtime.spawn(async move {
+                                    let _ = proxy.send_event(AppEvent::TorrentStatusChanged(
+                                        StreamStatus::Connecting { title: title.clone() },
+                                    ));
+
+                                    match engine.add_torrent_stream(&source, None).await {
+                                        Ok(status) => {
+                                            let _ = proxy.send_event(AppEvent::TorrentStatusChanged(status));
+                                        }
+                                        Err(err) => {
+                                            error!("Failed to add torrent stream: {err}");
+                                            let _ = proxy.send_event(AppEvent::TorrentStatusChanged(
+                                                StreamStatus::Error(err),
+                                            ));
+                                        }
+                                    }
+                                });
+                            } else {
+                                let _ = crate::stream::open_external(&source);
+                                ui.handle_app_event(&AppEvent::StatusMessage(
+                                    "Opened in external torrent client".to_string(),
+                                ));
+                            }
+                        }
+
+                        UiAction::StartTorrentDownload { source, title } => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine = engine.clone();
+                                let proxy = event_proxy.clone();
+                                let dest = config.download_dir.clone();
+                                info!("Starting torrent download: {title} to {:?}", dest);
+
+                                runtime.spawn(async move {
+                                    match engine.add_torrent_download(&source, &dest, None).await {
+                                        Ok(id) => {
+                                            info!("Torrent download #{id} queued for '{title}'");
+                                            let _ = proxy.send_event(AppEvent::StatusMessage(format!(
+                                                "Downloading '{title}'..."
+                                            )));
+                                        }
+                                        Err(err) => {
+                                            error!("Failed to add torrent download: {err}");
+                                            let _ = proxy.send_event(AppEvent::StatusMessage(format!(
+                                                "Download error: {err}"
+                                            )));
+                                        }
+                                    }
+                                });
+                            } else {
+                                let _ = crate::stream::open_external(&source);
+                                ui.handle_app_event(&AppEvent::StatusMessage(
+                                    "Opened in external torrent client".to_string(),
+                                ));
+                            }
+                        }
+
+                        UiAction::PauseTorrent(id) => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine = engine.clone();
+                                runtime.spawn(async move {
+                                    let _ = engine.pause_torrent(id).await;
+                                });
+                            }
+                        }
+
+                        UiAction::ResumeTorrent(id) => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine = engine.clone();
+                                runtime.spawn(async move {
+                                    let _ = engine.resume_torrent(id).await;
+                                });
+                            }
+                        }
+
+                        UiAction::CancelTorrent { id, delete_files } => {
+                            if let Some(engine) = torrent_engine.as_ref() {
+                                let engine = engine.clone();
+                                runtime.spawn(async move {
+                                    let _ = engine.cancel_torrent(id, delete_files).await;
+                                });
+                            }
+                        }
+
+                        UiAction::OpenTorrentFolder(path) => {
+                            let _ = crate::stream::open_folder(&path);
+                        }
+
+                        UiAction::ChangeDownloadDir => {
+                            let proxy = event_proxy.clone();
+                            std::thread::spawn(move || {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    let _ = proxy.send_event(AppEvent::DownloadDirChanged(folder));
+                                }
+                            });
+                        }
+
+                        UiAction::CopyText(text) => {
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                let _ = clip.set_text(text);
+                            }
+                            ui.handle_app_event(&AppEvent::StatusMessage("Copied to clipboard".to_string()));
+                        }
+
+                        UiAction::OpenExternal(target) => {
+                            let _ = crate::stream::open_external(&target);
+                            ui.handle_app_event(&AppEvent::StatusMessage("Opened in external application".to_string()));
                         }
 
                         UiAction::SelectBatchTorrentFile { id, file_idx } => {

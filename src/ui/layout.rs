@@ -87,6 +87,7 @@ pub struct LayoutGeometry {
     pub nyaa_search_btn: Rect,
     pub nyaa_trusted_checkbox: Rect,
     pub nyaa_category_dropdown: Rect,
+    pub stream_download_dir_btn: Rect,
     pub nyaa_results_list: Rect,
 }
 
@@ -193,16 +194,17 @@ impl LayoutGeometry {
         let nyaa_search_w = (nyaa_search_btn.x - drawer_x - 18).max(0);
         let nyaa_search_input = Rect::new(drawer_x + 12, 48, nyaa_search_w, 28);
 
-        let nyaa_trusted_checkbox = Rect::new(drawer_x + 12, 82, 105, 22);
-        let dropdown_x = nyaa_trusted_checkbox.right() + 8;
-        let dropdown_w = (drawer_x + drawer_w - 12 - dropdown_x).max(0);
-        let nyaa_category_dropdown = Rect::new(dropdown_x, 82, dropdown_w, 22);
+        let nyaa_trusted_checkbox = Rect::new(drawer_x + 12, 80, 95, 24);
+        let nyaa_category_dropdown = Rect::new(nyaa_trusted_checkbox.right() + 6, 80, 90, 24);
+        let dl_dir_x = nyaa_category_dropdown.right() + 6;
+        let dl_dir_w = (drawer_x + drawer_w - 12 - dl_dir_x).max(40);
+        let stream_download_dir_btn = Rect::new(dl_dir_x, 80, dl_dir_w, 24);
 
         let nyaa_results_list = Rect::new(
             drawer_x,
-            110,
+            108,
             drawer_w,
-            (height - 110).max(0),
+            (height - 108).max(0),
         );
 
         Self {
@@ -241,6 +243,7 @@ impl LayoutGeometry {
             nyaa_search_btn,
             nyaa_trusted_checkbox,
             nyaa_category_dropdown,
+            stream_download_dir_btn,
             nyaa_results_list,
         }
     }
