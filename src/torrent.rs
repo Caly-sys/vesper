@@ -28,6 +28,7 @@ pub struct ManagedTaskInfo {
     pub file_len: u64,
     pub is_stream: bool,
     pub dest_dir: PathBuf,
+    pub info_hash: Option<String>,
 }
 
 pub fn is_video_extension(ext: &str) -> bool {
@@ -58,6 +59,11 @@ impl TorrentEngine {
         if let Some(dht) = &mut session_opts.dht {
             dht.persistence = None;
         }
+        let rqbit_state = crate::config::rqbit_state_dir();
+        let _ = std::fs::create_dir_all(&rqbit_state);
+        session_opts.persistence = Some(librqbit::SessionPersistenceConfig::Json {
+            folder: Some(rqbit_state),
+        });
         session_opts.fastresume = true;
         session_opts.disable_trackers = false;
         session_opts.listen = Some(ListenerOptions {
@@ -105,7 +111,7 @@ impl TorrentEngine {
             }
         });
 
-        Ok(Self {
+        let engine = Self {
             cache_dir,
             auto_clean_on_exit,
             session,
@@ -113,7 +119,60 @@ impl TorrentEngine {
             http_port,
             tasks: Arc::new(RwLock::new(HashMap::new())),
             trackers: Arc::new(RwLock::new(Vec::new())),
-        })
+        };
+        engine.sync_persisted_torrents();
+        Ok(engine)
+    }
+
+    /// Synchronizes torrents restored from librqbit persistence into in-memory managed tasks
+    pub fn sync_persisted_torrents(&self) {
+        self.session.with_torrents(|iter| {
+            let mut tasks = self.tasks.write();
+            for (id, handle) in iter {
+                let id_val = id;
+                if !tasks.contains_key(&id_val) {
+                    let title = handle.name().unwrap_or_else(|| format!("Torrent #{id_val}"));
+                    let output_folder = handle.output_folder().to_path_buf();
+                    let metadata_arc = handle.metadata.load();
+                    let (rel, len) = if let Some(m) = metadata_arc.as_ref() {
+                        if m.file_infos.len() == 1 {
+                            (Some(m.file_infos[0].relative_filename.clone()), m.file_infos[0].len)
+                        } else {
+                            (None, m.file_infos.iter().map(|f| f.len).sum())
+                        }
+                    } else {
+                        (None, 0)
+                    };
+                    tasks.insert(
+                        id_val,
+                        ManagedTaskInfo {
+                            torrent_id: id_val,
+                            file_idx: None,
+                            title,
+                            file_rel_path: rel,
+                            file_len: len,
+                            is_stream: false,
+                            dest_dir: output_folder,
+                            info_hash: Some(handle.info_hash().as_string()),
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    /// Retrieve the lowercase info_hash for a given managed task ID
+    pub fn get_task_info_hash(&self, id: usize) -> Option<String> {
+        let tasks = self.tasks.read();
+        if let Some(task) = tasks.get(&id) {
+            if let Some(ref h) = task.info_hash {
+                return Some(h.to_ascii_lowercase());
+            }
+        }
+        if let Some(handle) = self.session.get(id.into()) {
+            return Some(handle.info_hash().as_string().to_ascii_lowercase());
+        }
+        None
     }
 
     /// Update the in-memory pool of merged custom and auto-synced trackers
@@ -311,6 +370,7 @@ impl TorrentEngine {
                                     file_len: 0,
                                     is_stream: true,
                                     dest_dir: self.cache_dir.clone(),
+                                    info_hash: Some(handle.info_hash().as_string()),
                                 },
                             );
                         }
@@ -376,6 +436,7 @@ impl TorrentEngine {
                                 file_len,
                                 is_stream: true,
                                 dest_dir: self.cache_dir.clone(),
+                                info_hash: Some(handle.info_hash().as_string()),
                             },
                         );
                     }
@@ -495,6 +556,7 @@ impl TorrentEngine {
                     file_len,
                     is_stream: true,
                     dest_dir: self.cache_dir.clone(),
+                    info_hash: Some(handle.info_hash().as_string()),
                 },
             );
         }
@@ -642,6 +704,7 @@ impl TorrentEngine {
                                     file_len: 0,
                                     is_stream: false,
                                     dest_dir: dest_dir.to_path_buf(),
+                                    info_hash: Some(handle.info_hash().as_string()),
                                 },
                             );
                         }
@@ -700,6 +763,7 @@ impl TorrentEngine {
                                 file_len,
                                 is_stream: false,
                                 dest_dir: dest_dir.to_path_buf(),
+                                info_hash: Some(handle.info_hash().as_string()),
                             },
                         );
                     }
@@ -796,6 +860,7 @@ impl TorrentEngine {
                     file_len,
                     is_stream: false,
                     dest_dir: dest_dir.to_path_buf(),
+                    info_hash: Some(handle.info_hash().as_string()),
                 },
             );
         }
@@ -1225,6 +1290,10 @@ mod stub {
 
         pub fn get_trackers(&self) -> Vec<String> {
             Vec::new()
+        }
+
+        pub fn get_task_info_hash(&self, _id: usize) -> Option<String> {
+            None
         }
 
         pub async fn add_torrent_stream(

@@ -164,6 +164,8 @@ pub struct UiState {
     pub tracker_list_url: String,
     pub custom_trackers: Vec<String>,
     pub cached_remote_trackers: Vec<String>,
+    pub completed_hashes: HashSet<String>,
+    pub watch_progress_keys: std::collections::HashMap<String, f64>,
 
     // Interaction
     pub hovered_control: Option<HoverControl>,
@@ -238,6 +240,8 @@ impl Default for UiState {
             tracker_list_url: crate::config::default_tracker_list_url(),
             custom_trackers: Vec::new(),
             cached_remote_trackers: Vec::new(),
+            completed_hashes: HashSet::new(),
+            watch_progress_keys: std::collections::HashMap::new(),
 
             hovered_control: None,
             is_dragging_seekbar: false,
@@ -2468,13 +2472,37 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     border_color,
                 );
 
-                // Title
+                // Check if info_hash matches a locally completed download
+                let item_hash = item.info_hash.as_ref().map(|h| h.to_ascii_lowercase());
+                let is_downloaded = item_hash
+                    .as_ref()
+                    .map(|h| state.completed_hashes.contains(h))
+                    .unwrap_or(false);
+
+                // Title (with subtle Downloaded badge if completed)
+                let title_max_w = if is_downloaded {
+                    let badge_w = 78;
+                    draw_badge(
+                        hdc,
+                        "Downloaded",
+                        row_r.x + row_r.w - 10 - badge_w,
+                        row_r.y + 8,
+                        fonts.small_bold,
+                        COLOR_BG,
+                        Some(COLOR_SUCCESS),
+                        COLOR_SUCCESS,
+                    );
+                    (row_r.w - 20 - badge_w - 8).max(0)
+                } else {
+                    row_r.w - 20
+                };
+
                 draw_text(
                     hdc,
                     &item.clean_title,
                     row_r.x + 10,
                     row_r.y + 8,
-                    row_r.w - 20,
+                    title_max_w,
                     20,
                     fonts.bold,
                     if is_hover {
@@ -2491,7 +2519,23 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                 if cfg!(feature = "torrent") {
                     let copy_x = row_r.x + row_r.w - 10 - 40;
                     let dl_x = copy_x - 6 - 58;
-                    let watch_x = dl_x - 6 - 50;
+
+                    let has_progress = item_hash
+                        .as_ref()
+                        .and_then(|h| state.watch_progress_keys.get(h))
+                        .map(|pos| *pos >= 10.0)
+                        .unwrap_or(false);
+
+                    let (watch_label, watch_w) = if is_downloaded {
+                        if has_progress {
+                            ("Resume", 56)
+                        } else {
+                            ("Play", 46)
+                        }
+                    } else {
+                        ("Watch", 50)
+                    };
+                    let watch_x = dl_x - 6 - watch_w;
 
                     let meta_text = format!("{} · {}S / {}L", item.size, item.seeders, item.leechers);
                     let meta_max_w = (watch_x - row_r.x - 14).max(0);
@@ -2513,7 +2557,7 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                         hdc,
                         watch_x,
                         btn_y,
-                        50,
+                        watch_w,
                         btn_h,
                         4,
                         if is_watch_hover {
@@ -2525,10 +2569,10 @@ fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &The
                     );
                     draw_text(
                         hdc,
-                        "Watch",
+                        watch_label,
                         watch_x,
                         btn_y,
-                        50,
+                        watch_w,
                         btn_h,
                         fonts.small_bold,
                         COLOR_TEXT_PRIMARY,

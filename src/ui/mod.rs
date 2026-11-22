@@ -1865,7 +1865,7 @@ impl VesperUi {
                                 }
                                 let item_h = 72;
                                 let item_margin = 6;
-                                for (idx, _) in self.state.nyaa_results.iter().enumerate() {
+                                for (idx, item) in self.state.nyaa_results.iter().enumerate() {
                                     let row_r = Rect::new(
                                         self.geom.nyaa_results_list.x + 12,
                                         y,
@@ -1879,13 +1879,17 @@ impl VesperUi {
                                         if cfg!(feature = "torrent") {
                                             let copy_x = row_r.x + row_r.w - 10 - 40;
                                             let dl_x = copy_x - 6 - 58;
-                                            let stream_x = dl_x - 6 - 50;
+
+                                            let is_dl = item.info_hash.as_ref().map(|h| self.state.completed_hashes.contains(&h.to_ascii_lowercase())).unwrap_or(false);
+                                            let has_prog = is_dl && item.info_hash.as_ref().and_then(|h| self.state.watch_progress_keys.get(&h.to_ascii_lowercase())).map(|p| *p >= 10.0).unwrap_or(false);
+                                            let watch_w = if is_dl { if has_prog { 56 } else { 46 } } else { 50 };
+                                            let stream_x = dl_x - 6 - watch_w;
 
                                             if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
                                                 new_hover = Some(HoverControl::NyaaResultCopyMagnet(idx));
                                             } else if Rect::new(dl_x, btn_y, 58, btn_h).contains(px, py) {
                                                 new_hover = Some(HoverControl::NyaaResultDownload(idx));
-                                            } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
+                                            } else if Rect::new(stream_x, btn_y, watch_w, btn_h).contains(px, py) {
                                                 new_hover = Some(HoverControl::NyaaResultStream(idx));
                                             } else {
                                                 new_hover = Some(HoverControl::NyaaResult(idx));
@@ -2646,7 +2650,11 @@ impl VesperUi {
                                     if cfg!(feature = "torrent") {
                                         let copy_x = row_r.x + row_r.w - 10 - 40;
                                         let dl_x = copy_x - 6 - 58;
-                                        let stream_x = dl_x - 6 - 50;
+
+                                        let is_dl = item.info_hash.as_ref().map(|h| self.state.completed_hashes.contains(&h.to_ascii_lowercase())).unwrap_or(false);
+                                        let has_prog = is_dl && item.info_hash.as_ref().and_then(|h| self.state.watch_progress_keys.get(&h.to_ascii_lowercase())).map(|p| *p >= 10.0).unwrap_or(false);
+                                        let watch_w = if is_dl { if has_prog { 56 } else { 46 } } else { 50 };
+                                        let stream_x = dl_x - 6 - watch_w;
 
                                         if Rect::new(copy_x, btn_y, 40, btn_h).contains(px, py) {
                                             let magnet =
@@ -2683,7 +2691,7 @@ impl VesperUi {
                                                 title: item.clean_title.clone(),
                                             });
                                             return true;
-                                        } else if Rect::new(stream_x, btn_y, 50, btn_h).contains(px, py) {
+                                        } else if Rect::new(stream_x, btn_y, watch_w, btn_h).contains(px, py) {
                                             self.action_queue
                                                 .push_back(UiAction::StreamNyaa(item.clone()));
                                             return true;

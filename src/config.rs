@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Application configuration for Vesper
@@ -52,7 +53,7 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn default_auto_clean_cache() -> bool {
-    true
+    false
 }
 
 fn default_download_dir() -> PathBuf {
@@ -64,7 +65,7 @@ fn default_download_dir() -> PathBuf {
 }
 
 fn default_keep_streamed_files() -> bool {
-    false
+    true
 }
 
 fn default_sub_lang() -> String {
@@ -130,6 +131,125 @@ pub fn config_path() -> PathBuf {
     }
 
     PathBuf::from("vesper.toml")
+}
+
+/// Locates the Vesper data directory (where state and session cache reside).
+pub fn data_dir() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    PathBuf::from(".")
+}
+
+/// Locates the `vesper_state.json` registry path.
+pub fn state_file_path() -> PathBuf {
+    data_dir().join("vesper_state.json")
+}
+
+/// Locates the `librqbit` persistent session state folder.
+pub fn rqbit_state_dir() -> PathBuf {
+    data_dir().join("vesper_rqbit_state")
+}
+
+/// Record of a completed torrent on disk
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletedTorrent {
+    pub title: String,
+    pub local_path: PathBuf,
+    #[serde(default)]
+    pub file_indices: Vec<usize>,
+    #[serde(default)]
+    pub completed_at: u64,
+}
+
+/// Watch position progress marker
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchProgress {
+    pub position_secs: f64,
+    pub duration_secs: f64,
+}
+
+/// Lightweight persistent state saved to `vesper_state.json`
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VesperState {
+    #[serde(default)]
+    pub completed_torrents: HashMap<String, CompletedTorrent>,
+    #[serde(default)]
+    pub watch_progress: HashMap<String, WatchProgress>,
+}
+
+impl VesperState {
+    pub fn load() -> Self {
+        let path = state_file_path();
+        if !path.exists() {
+            return Self::default();
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!("Failed to read state file {:?}: {e}", path);
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = state_file_path();
+        let json = serde_json::to_string_pretty(self)
+            .context("Failed to serialize VesperState to JSON")?;
+        std::fs::write(&path, json)
+            .with_context(|| format!("Failed to write state to {:?}", path))?;
+        Ok(())
+    }
+
+    pub fn normalize_key(key: &str) -> String {
+        key.trim().to_lowercase().replace('/', "\\")
+    }
+
+    pub fn record_completed(&mut self, info_hash: &str, title: &str, local_path: PathBuf, file_indices: Vec<usize>) {
+        let key = info_hash.trim().to_lowercase();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.completed_torrents.insert(
+            key,
+            CompletedTorrent {
+                title: title.to_string(),
+                local_path,
+                file_indices,
+                completed_at: now,
+            },
+        );
+        let _ = self.save();
+    }
+
+    pub fn record_progress(&mut self, file_or_hash: &str, pos: f64, dur: f64) {
+        if pos <= 0.0 && dur <= 0.0 {
+            return;
+        }
+        let key = Self::normalize_key(file_or_hash);
+        self.watch_progress.insert(
+            key,
+            WatchProgress {
+                position_secs: pos,
+                duration_secs: dur,
+            },
+        );
+        let _ = self.save();
+    }
+
+    pub fn get_progress(&self, file_or_hash: &str) -> Option<&WatchProgress> {
+        let key = Self::normalize_key(file_or_hash);
+        self.watch_progress.get(&key)
+    }
+
+    pub fn is_downloaded(&self, info_hash: &str) -> Option<&CompletedTorrent> {
+        let key = info_hash.trim().to_lowercase();
+        self.completed_torrents.get(&key).filter(|c| c.local_path.exists())
+    }
 }
 
 /// Loads configuration from `vesper.toml`.
@@ -201,9 +321,9 @@ mod tests {
         assert_eq!(config.nyaa_base_url, "https://nyaa.si");
         assert_eq!(config.default_sub_lang, "eng");
         assert_eq!(config.volume, 100.0);
-        assert!(config.auto_clean_cache);
+        assert!(!config.auto_clean_cache);
         assert!(config.cache_dir.ends_with("vesper-cache"));
-        assert!(!config.keep_streamed_files);
+        assert!(config.keep_streamed_files);
         assert!(config.download_dir.ends_with("Vesper") || config.download_dir.ends_with("Vesper-Downloads"));
         assert!(config.auto_sync_trackers);
         assert!(config.tracker_list_url.contains("ngosang/trackerslist"));
@@ -217,5 +337,22 @@ mod tests {
         let toml_str = toml::to_string(&config).expect("serialize");
         let parsed: VesperConfig = toml::from_str(&toml_str).expect("deserialize");
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_vesper_state_methods() {
+        let mut state = VesperState::default();
+        state.record_progress("C:/Videos/Ep1.mkv", 120.5, 1440.0);
+        let wp = state.get_progress("c:\\videos\\ep1.mkv").expect("progress found");
+        assert_eq!(wp.position_secs, 120.5);
+        assert_eq!(wp.duration_secs, 1440.0);
+
+        state.record_completed(
+            "0123456789abcdef0123456789abcdef01234567",
+            "Episode 1",
+            PathBuf::from("C:\\fake_file.mkv"),
+            vec![0],
+        );
+        assert!(state.completed_torrents.contains_key("0123456789abcdef0123456789abcdef01234567"));
     }
 }

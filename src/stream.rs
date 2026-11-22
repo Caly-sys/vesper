@@ -164,6 +164,25 @@ pub fn is_magnet(s: &str) -> bool {
     s.trim().starts_with("magnet:?")
 }
 
+/// Extracts the 40-char hex (or 32-char base32) info hash from a magnet URI or raw hash string
+pub fn extract_info_hash(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if (trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+        || (trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return Some(trimmed.to_ascii_lowercase());
+    }
+
+    if let Some(pos) = trimmed.find("xt=urn:btih:") {
+        let after = &trimmed[pos + "xt=urn:btih:".len()..];
+        let hash = after.split('&').next().unwrap_or("").trim();
+        if !hash.is_empty() {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
 /// Returns true if the string is a remote HTTP/HTTPS .torrent file link
 pub fn is_torrent_url(s: &str) -> bool {
     let trimmed = s.trim();
@@ -351,5 +370,18 @@ mod tests {
         // Appending again does not duplicate
         let double_enriched = append_trackers_to_magnet(&enriched, &trackers);
         assert_eq!(enriched, double_enriched);
+    }
+
+    #[test]
+    fn test_extract_info_hash() {
+        assert_eq!(
+            extract_info_hash("4a12345678901234567890123456789012345678"),
+            Some("4a12345678901234567890123456789012345678".to_string())
+        );
+        assert_eq!(
+            extract_info_hash("magnet:?xt=urn:btih:4A12345678901234567890123456789012345678&dn=My+Anime"),
+            Some("4a12345678901234567890123456789012345678".to_string())
+        );
+        assert_eq!(extract_info_hash("https://example.com/video.mp4"), None);
     }
 }
