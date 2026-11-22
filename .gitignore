@@ -4,6 +4,7 @@
 
 # Compiled Windows binaries & packages (publish these in GitHub Releases instead)
 *.exe
+!vesper.exe
 *.pdb
 *.zip
 *.7z
