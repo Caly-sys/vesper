@@ -1,0 +1,2067 @@
+#![allow(dead_code)]
+
+use std::path::PathBuf;
+use std::time::Instant;
+use windows::Win32::Graphics::Gdi::*;
+
+use crate::types::{
+    AudioTrack, ChapterInfo, EpisodeEntry, NyaaCategory, NyaaItem, SubCue, SubTrack,
+    TorrentFileInfo,
+};
+use crate::ui::layout::{LayoutGeometry, Rect};
+use crate::ui::theme::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Subtitles,
+    Episodes,
+    Nyaa,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoverControl {
+    BottomBarOpen,
+    EmptyStateOpenFile,
+    EmptyStateOpenFolder,
+    EpisodesOpenFolder,
+    PlayPause,
+    Next,
+    Seekbar,
+    VolumeIcon,
+    VolumeSlider,
+    AudioToggle,
+    SubToggle,
+    SubPopoverItem(usize),
+    AudioPopoverItem(usize),
+    SubTrackSelector,
+    SubTrackSelectorItem(usize),
+    Fullscreen,
+    DrawerToggle,
+    Tab(Tab),
+    CueCard(usize),
+    CueCopy(usize),
+    ExtractAss,
+    Episode(usize),
+    NyaaSearchInput,
+    NyaaSearchBtn,
+    NyaaTrustedCheckbox,
+    NyaaCategoryDropdown,
+    NyaaCategoryItem(usize),
+    NyaaResult(usize),
+    BatchFile(usize),
+    BatchConfirm,
+    BatchCancel,
+}
+
+pub struct UiState {
+    // Playback state
+    pub media_title: String,
+    pub current_path: Option<PathBuf>,
+    pub time_pos: f64,
+    pub duration: f64,
+    pub paused: bool,
+    pub volume: f64,
+    pub muted: bool,
+    pub unmuted_volume: f64,
+    pub chapters: Vec<ChapterInfo>,
+    pub tracks: Vec<SubTrack>,
+    pub audio_tracks: Vec<AudioTrack>,
+    pub selected_sub_idx: usize,
+    pub sub_popover_open: bool,
+    pub audio_popover_open: bool,
+    pub selected_extract_sub_id: Option<i64>,
+    pub sidebar_sub_dropdown_open: bool,
+    pub is_fullscreen: bool,
+    pub drawer_open: bool,
+    pub active_tab: Tab,
+
+    // Subtitles tab
+    pub cues: Vec<SubCue>,
+    pub active_cue_idx: Option<usize>,
+    pub sub_scroll_y: i32,
+    pub copied_feedback: Option<(usize, Instant)>,
+    pub is_streaming_torrent: bool,
+    pub is_torrent_complete: bool,
+    pub torrent_status_text: String,
+
+    // Episodes tab
+    pub episodes: Vec<EpisodeEntry>,
+    pub active_ep_idx: Option<usize>,
+    pub ep_scroll_y: i32,
+    pub last_ep_click: Option<(Instant, usize)>,
+
+    // Nyaa tab
+    pub search_query: String,
+    pub search_focused: bool,
+    pub trusted_only: bool,
+    pub category: NyaaCategory,
+    pub category_dropdown_open: bool,
+    pub nyaa_results: Vec<NyaaItem>,
+    pub searching: bool,
+    pub nyaa_error: Option<String>,
+    pub nyaa_scroll_y: i32,
+
+    // Batch torrent selection modal
+    pub batch_modal: Option<(usize, Vec<TorrentFileInfo>, usize)>,
+
+    // Interaction
+    pub hovered_control: Option<HoverControl>,
+    pub is_dragging_seekbar: bool,
+    pub is_dragging_volume: bool,
+    pub mouse_pos: (i32, i32),
+    pub tooltip: Option<(String, i32, i32)>,
+    pub status_message: Option<(String, Instant)>,
+    pub last_mouse_activity: Instant,
+    pub bar_visible: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            media_title: "Vesper".to_string(),
+            current_path: None,
+            time_pos: 0.0,
+            duration: 0.0,
+            paused: false,
+            volume: 100.0,
+            muted: false,
+            unmuted_volume: 100.0,
+            chapters: Vec::new(),
+            tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            selected_sub_idx: 0,
+            sub_popover_open: false,
+            audio_popover_open: false,
+            selected_extract_sub_id: None,
+            sidebar_sub_dropdown_open: false,
+            is_fullscreen: false,
+            drawer_open: true,
+            active_tab: Tab::Subtitles,
+
+            cues: Vec::new(),
+            active_cue_idx: None,
+            sub_scroll_y: 0,
+            copied_feedback: None,
+            is_streaming_torrent: false,
+            is_torrent_complete: false,
+            torrent_status_text: String::new(),
+
+            episodes: Vec::new(),
+            active_ep_idx: None,
+            ep_scroll_y: 0,
+            last_ep_click: None,
+
+            search_query: String::new(),
+            search_focused: false,
+            trusted_only: true,
+            category: NyaaCategory::AnimeEng,
+            category_dropdown_open: false,
+            nyaa_results: Vec::new(),
+            searching: false,
+            nyaa_error: None,
+            nyaa_scroll_y: 0,
+
+            batch_modal: None,
+
+            hovered_control: None,
+            is_dragging_seekbar: false,
+            is_dragging_volume: false,
+            mouse_pos: (0, 0),
+            tooltip: None,
+            status_message: None,
+            last_mouse_activity: Instant::now(),
+            bar_visible: true,
+        }
+    }
+}
+
+pub fn audio_button_label(state: &UiState) -> String {
+    if let Some(tr) = state.audio_tracks.iter().find(|t| t.selected) {
+        let lang = if !tr.lang.is_empty() {
+            tr.lang.to_uppercase()
+        } else {
+            "AUD".to_string()
+        };
+        let codec = if !tr.codec.is_empty() {
+            tr.codec.to_uppercase()
+        } else {
+            "".to_string()
+        };
+        if !codec.is_empty() {
+            format!("{lang} · {codec}")
+        } else {
+            lang
+        }
+    } else if state.audio_tracks.is_empty() {
+        "AUDIO".to_string()
+    } else {
+        "AUDIO".to_string()
+    }
+}
+
+pub fn sub_button_label(state: &UiState) -> String {
+    if let Some(tr) = state.tracks.iter().find(|t| t.selected) {
+        let lang = if !tr.lang.is_empty() {
+            tr.lang.to_uppercase()
+        } else {
+            "SUB".to_string()
+        };
+        let codec = if !tr.codec.is_empty() {
+            tr.codec.to_uppercase()
+        } else {
+            "".to_string()
+        };
+        if !codec.is_empty() {
+            format!("{lang} · {codec}")
+        } else {
+            lang
+        }
+    } else if state.tracks.is_empty() {
+        "SUB".to_string()
+    } else {
+        "OFF".to_string()
+    }
+}
+
+pub fn format_time(seconds: f64) -> String {
+    let total_secs = seconds.max(0.0) as u64;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = total_secs / 3600;
+
+    if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
+pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
+    // 1. Draw theater video backdrop (deep viewport black #0E0E11)
+    fill_rect(
+        hdc,
+        geom.video_rect.x,
+        geom.video_rect.y,
+        geom.video_rect.w,
+        geom.video_rect.h,
+        COLOR_VIEWPORT_BG,
+    );
+
+    // If no media is loaded, render clean dark dropzone empty state inside video area
+    if state.current_path.is_none() && state.duration <= 0.0 {
+        let dz = &geom.empty_dropzone_rect;
+        if dz.w > 160 && dz.h > 120 {
+            // Dropzone card
+            draw_rounded_rect(
+                hdc,
+                dz.x,
+                dz.y,
+                dz.w,
+                dz.h,
+                10,
+                COLOR_SURFACE,
+                Some(COLOR_BORDER),
+            );
+
+            // App title
+            draw_text(
+                hdc,
+                "Vesper",
+                dz.x,
+                dz.y + 24,
+                dz.w,
+                26,
+                fonts.heading,
+                COLOR_TEXT_PRIMARY,
+                DT_CENTER | DT_SINGLELINE,
+            );
+
+            // Subtle drop hint
+            draw_text(
+                hdc,
+                "Drop an .mkv anime file here",
+                dz.x,
+                dz.y + 58,
+                dz.w,
+                20,
+                fonts.regular,
+                COLOR_TEXT_SECONDARY,
+                DT_CENTER | DT_SINGLELINE,
+            );
+
+            // Secondary subtitle
+            draw_text(
+                hdc,
+                "or open media to begin playback",
+                dz.x,
+                dz.y + 80,
+                dz.w,
+                18,
+                fonts.small,
+                COLOR_TEXT_MUTED,
+                DT_CENTER | DT_SINGLELINE,
+            );
+
+            // Open File button (Ctrl+O)
+            let of_hover = state.hovered_control == Some(HoverControl::EmptyStateOpenFile);
+            draw_rounded_rect(
+                hdc,
+                geom.empty_open_file.x,
+                geom.empty_open_file.y,
+                geom.empty_open_file.w,
+                geom.empty_open_file.h,
+                6,
+                if of_hover {
+                    COLOR_ACCENT_HOVER
+                } else {
+                    COLOR_ACCENT
+                },
+                Some(COLOR_ACCENT_MUTED),
+            );
+            draw_text(
+                hdc,
+                "🎬 Open File",
+                geom.empty_open_file.x,
+                geom.empty_open_file.y,
+                geom.empty_open_file.w,
+                geom.empty_open_file.h,
+                fonts.bold,
+                COLOR_TEXT_PRIMARY,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            // Open Folder button (Ctrl+Shift+O)
+            let ofd_hover = state.hovered_control == Some(HoverControl::EmptyStateOpenFolder);
+            draw_rounded_rect(
+                hdc,
+                geom.empty_open_folder.x,
+                geom.empty_open_folder.y,
+                geom.empty_open_folder.w,
+                geom.empty_open_folder.h,
+                6,
+                if ofd_hover {
+                    COLOR_SURFACE_HOVER
+                } else {
+                    COLOR_BG
+                },
+                Some(if ofd_hover {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_BORDER
+                }),
+            );
+            draw_text(
+                hdc,
+                "📁 Open Folder",
+                geom.empty_open_folder.x,
+                geom.empty_open_folder.y,
+                geom.empty_open_folder.w,
+                geom.empty_open_folder.h,
+                fonts.bold,
+                if ofd_hover {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_PRIMARY
+                },
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+
+            // Keyboard shortcut guide line
+            draw_text(
+                hdc,
+                "Ctrl+O: Open File  •  Ctrl+Shift+O: Open Folder  •  Space: Play  •  Tab: Sidebar",
+                dz.x,
+                dz.bottom() + 16,
+                dz.w,
+                18,
+                fonts.small,
+                COLOR_TEXT_MUTED,
+                DT_CENTER | DT_SINGLELINE,
+            );
+        }
+    }
+
+    // 2. Render right collapsible drawer
+    if geom.drawer_rect.w > 0 {
+        render_drawer(hdc, geom, state, fonts);
+    }
+
+    // 4. Render subtle auto-dismissing status/error toast in viewport
+    if let Some((ref msg, instant)) = state.status_message {
+        if instant.elapsed().as_secs_f32() < 4.5 {
+            render_toast(hdc, geom, msg, fonts);
+        }
+    }
+
+    // 5. Render modal dialog if open (e.g. batch torrent selection)
+    if let Some((_, ref files, selected_idx)) = state.batch_modal {
+        render_batch_modal(hdc, geom, files, selected_idx, fonts, state);
+    }
+
+    // 6. Render active tooltip
+    if let Some((ref text, tx, ty)) = state.tooltip {
+        render_tooltip(hdc, text, tx, ty, fonts);
+    }
+}
+
+pub fn render_bottom_bar(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
+    let r = &geom.bottom_bar_rect;
+    // Surface background
+    fill_rect(hdc, r.x, r.y, r.w, r.h, COLOR_SURFACE);
+
+    // Top border line
+    fill_rect(hdc, r.x, r.y, r.w, 1, COLOR_BORDER);
+
+    // Open File/Folder button (compact left button)
+    let open_hover = state.hovered_control == Some(HoverControl::BottomBarOpen);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_open.x,
+        geom.btn_open.y,
+        geom.btn_open.w,
+        geom.btn_open.h,
+        6,
+        if open_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if open_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        "📁",
+        geom.btn_open.x,
+        geom.btn_open.y,
+        geom.btn_open.w,
+        geom.btn_open.h,
+        fonts.regular,
+        if open_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Play/Pause button
+    let pp_hover = state.hovered_control == Some(HoverControl::PlayPause);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_play_pause.x,
+        geom.btn_play_pause.y,
+        geom.btn_play_pause.w,
+        geom.btn_play_pause.h,
+        6,
+        if pp_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if pp_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    let pp_icon = if state.paused { "▶" } else { "❚❚" };
+    draw_text(
+        hdc,
+        pp_icon,
+        geom.btn_play_pause.x,
+        geom.btn_play_pause.y,
+        geom.btn_play_pause.w,
+        geom.btn_play_pause.h,
+        fonts.bold,
+        if pp_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Next Episode button
+    let next_hover = state.hovered_control == Some(HoverControl::Next);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_next.x,
+        geom.btn_next.y,
+        geom.btn_next.w,
+        geom.btn_next.h,
+        6,
+        if next_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if next_hover {
+            COLOR_BORDER_HOVER
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        "⏭",
+        geom.btn_next.x,
+        geom.btn_next.y,
+        geom.btn_next.w,
+        geom.btn_next.h,
+        fonts.regular,
+        if next_hover {
+            COLOR_TEXT_PRIMARY
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Time text: 05:23 / 24:12 or error indicator
+    let is_recent_err = state
+        .status_message
+        .as_ref()
+        .map(|(msg, inst)| inst.elapsed().as_secs_f32() < 4.5 && msg.starts_with("Playback error"))
+        .unwrap_or(false);
+
+    if is_recent_err {
+        draw_text(
+            hdc,
+            "⚠ Playback Error",
+            geom.time_text_rect.x,
+            geom.time_text_rect.y,
+            geom.time_text_rect.w,
+            geom.time_text_rect.h,
+            fonts.small_bold,
+            COLOR_ERROR,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    } else {
+        let time_str = format!(
+            "{} / {}",
+            format_time(state.time_pos),
+            format_time(state.duration)
+        );
+        draw_text(
+            hdc,
+            &time_str,
+            geom.time_text_rect.x,
+            geom.time_text_rect.y,
+            geom.time_text_rect.w,
+            geom.time_text_rect.h,
+            fonts.mono,
+            COLOR_TEXT_SECONDARY,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+
+    // Seekbar with chapters
+    render_seekbar(hdc, geom, state);
+
+    // Volume icon
+    let vol_hover = state.hovered_control == Some(HoverControl::VolumeIcon);
+    let vol_icon = if state.muted || state.volume <= 0.0 {
+        "🔇"
+    } else if state.volume < 40.0 {
+        "🔈"
+    } else {
+        "🔊"
+    };
+    draw_text(
+        hdc,
+        vol_icon,
+        geom.btn_vol_icon.x,
+        geom.btn_vol_icon.y,
+        geom.btn_vol_icon.w,
+        geom.btn_vol_icon.h,
+        fonts.regular,
+        if vol_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Volume slider
+    render_vol_slider(hdc, geom, state);
+
+    // Audio track toggle button
+    let aud_hover = state.hovered_control == Some(HoverControl::AudioToggle);
+    let aud_label = audio_button_label(state);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_audio_toggle.x,
+        geom.btn_audio_toggle.y,
+        geom.btn_audio_toggle.w,
+        geom.btn_audio_toggle.h,
+        6,
+        if aud_hover || state.audio_popover_open {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if aud_hover || state.audio_popover_open {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        &aud_label,
+        geom.btn_audio_toggle.x,
+        geom.btn_audio_toggle.y,
+        geom.btn_audio_toggle.w,
+        geom.btn_audio_toggle.h,
+        fonts.small_bold,
+        if aud_hover || state.audio_popover_open {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Subtitle track toggle button
+    let sub_hover = state.hovered_control == Some(HoverControl::SubToggle);
+    let sub_label = sub_button_label(state);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_sub_toggle.x,
+        geom.btn_sub_toggle.y,
+        geom.btn_sub_toggle.w,
+        geom.btn_sub_toggle.h,
+        6,
+        if sub_hover || state.sub_popover_open {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if sub_hover || state.sub_popover_open {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        &sub_label,
+        geom.btn_sub_toggle.x,
+        geom.btn_sub_toggle.y,
+        geom.btn_sub_toggle.w,
+        geom.btn_sub_toggle.h,
+        fonts.small_bold,
+        if sub_hover || state.sub_popover_open {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+
+    // Fullscreen toggle button
+    let fs_hover = state.hovered_control == Some(HoverControl::Fullscreen);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_fullscreen.x,
+        geom.btn_fullscreen.y,
+        geom.btn_fullscreen.w,
+        geom.btn_fullscreen.h,
+        6,
+        if fs_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if fs_hover {
+            COLOR_BORDER_HOVER
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        if state.is_fullscreen { "⛶" } else { "⛶" },
+        geom.btn_fullscreen.x,
+        geom.btn_fullscreen.y,
+        geom.btn_fullscreen.w,
+        geom.btn_fullscreen.h,
+        fonts.regular,
+        if fs_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Drawer collapse toggle button (< / >)
+    let dr_hover = state.hovered_control == Some(HoverControl::DrawerToggle);
+    draw_rounded_rect(
+        hdc,
+        geom.btn_drawer_toggle.x,
+        geom.btn_drawer_toggle.y,
+        geom.btn_drawer_toggle.w,
+        geom.btn_drawer_toggle.h,
+        6,
+        if dr_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if dr_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    let toggle_symbol = if state.drawer_open { ">" } else { "<" };
+    draw_text(
+        hdc,
+        toggle_symbol,
+        geom.btn_drawer_toggle.x,
+        geom.btn_drawer_toggle.y,
+        geom.btn_drawer_toggle.w,
+        geom.btn_drawer_toggle.h,
+        fonts.bold,
+        if dr_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+fn render_seekbar(hdc: HDC, geom: &LayoutGeometry, state: &UiState) {
+    let sb = &geom.seekbar_rect;
+    if sb.w <= 10 {
+        return;
+    }
+
+    let track_y = sb.y + (sb.h - 6) / 2;
+    let track_h = 6;
+
+    // Background track
+    draw_rounded_rect(
+        hdc,
+        sb.x,
+        track_y,
+        sb.w,
+        track_h,
+        3,
+        COLOR_SEEK_TRACK,
+        None,
+    );
+
+    // Progress fraction
+    let pct = if state.duration > 0.0 {
+        (state.time_pos / state.duration).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let fill_w = ((sb.w as f64) * pct) as i32;
+
+    if fill_w > 0 {
+        draw_rounded_rect(
+            hdc,
+            sb.x,
+            track_y,
+            fill_w,
+            track_h,
+            3,
+            COLOR_ACCENT,
+            None,
+        );
+    }
+
+    // Chapter tick marks (OP/ED/parts) - contained within seekbar track height, disabled if > 50
+    if state.duration > 0.0 && state.chapters.len() <= 50 {
+        for ch in &state.chapters {
+            let ch_pct = (ch.time / state.duration).clamp(0.0, 1.0);
+            let ch_x = sb.x + ((sb.w as f64) * ch_pct) as i32;
+            let is_op_ed = ch.title.to_lowercase().contains("op")
+                || ch.title.to_lowercase().contains("ed")
+                || ch.title.to_lowercase().contains("opening")
+                || ch.title.to_lowercase().contains("ending");
+
+            let tick_color = if is_op_ed {
+                COLOR_WARNING
+            } else {
+                COLOR_ACCENT_HOVER
+            };
+            fill_rect(hdc, ch_x - 1, track_y, 2, track_h, tick_color);
+        }
+    }
+
+    // Seek thumb handle
+    let thumb_x = (sb.x + fill_w).clamp(sb.x, sb.x + sb.w);
+    let thumb_radius = if state.is_dragging_seekbar || state.hovered_control == Some(HoverControl::Seekbar) {
+        6
+    } else {
+        4
+    };
+    draw_rounded_rect(
+        hdc,
+        thumb_x - thumb_radius,
+        track_y + track_h / 2 - thumb_radius,
+        thumb_radius * 2,
+        thumb_radius * 2,
+        thumb_radius * 2,
+        COLOR_TEXT_PRIMARY,
+        Some(COLOR_ACCENT),
+    );
+}
+
+fn render_vol_slider(hdc: HDC, geom: &LayoutGeometry, state: &UiState) {
+    let vs = &geom.vol_slider_rect;
+    if vs.w <= 5 {
+        return;
+    }
+    let track_y = vs.y + (vs.h - 4) / 2;
+    let track_h = 4;
+
+    // Track
+    draw_rounded_rect(hdc, vs.x, track_y, vs.w, track_h, 2, COLOR_SEEK_TRACK, None);
+
+    // Fill
+    let vol_pct = if state.muted {
+        0.0
+    } else {
+        (state.volume / 100.0).clamp(0.0, 1.0)
+    };
+    let fill_w = ((vs.w as f64) * vol_pct) as i32;
+    if fill_w > 0 {
+        draw_rounded_rect(hdc, vs.x, track_y, fill_w, track_h, 2, COLOR_ACCENT, None);
+    }
+
+    // Thumb
+    let thumb_x = (vs.x + fill_w).clamp(vs.x, vs.x + vs.w);
+    let r = 4;
+    draw_rounded_rect(
+        hdc,
+        thumb_x - r,
+        track_y + track_h / 2 - r,
+        r * 2,
+        r * 2,
+        r * 2,
+        COLOR_TEXT_PRIMARY,
+        Some(COLOR_ACCENT),
+    );
+}
+
+fn render_drawer(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
+    let dr = &geom.drawer_rect;
+
+    // Drawer background
+    fill_rect(hdc, dr.x, dr.y, dr.w, dr.h, COLOR_SURFACE);
+
+    // Left border separating viewport and drawer
+    fill_rect(hdc, dr.x, dr.y, 1, dr.h, COLOR_BORDER);
+
+    // Tab Header (3 tabs: Subtitles, Episodes, Nyaa)
+    render_tabs(hdc, geom, state, fonts);
+
+    // Tab Content Area
+    match state.active_tab {
+        Tab::Subtitles => render_tab_subtitles(hdc, geom, state, fonts),
+        Tab::Episodes => render_tab_episodes(hdc, geom, state, fonts),
+        Tab::Nyaa => render_tab_nyaa(hdc, geom, state, fonts),
+    }
+}
+
+fn render_tabs(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
+    // Bottom border of tab bar
+    fill_rect(
+        hdc,
+        geom.drawer_tab_bar.x,
+        geom.drawer_tab_bar.bottom() - 1,
+        geom.drawer_tab_bar.w,
+        1,
+        COLOR_BORDER,
+    );
+
+    let tabs = [
+        (Tab::Subtitles, "Subtitles", geom.tab_subtitles),
+        (Tab::Episodes, "Episodes", geom.tab_episodes),
+        (Tab::Nyaa, "Stream", geom.tab_nyaa),
+    ];
+
+    for (tab, title, r) in tabs {
+        let is_active = state.active_tab == tab;
+        let is_hover = state.hovered_control == Some(HoverControl::Tab(tab));
+
+        let bg_color = if is_active {
+            COLOR_ACCENT
+        } else if is_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        };
+
+        let text_color = if is_active {
+            COLOR_TEXT_PRIMARY
+        } else if is_hover {
+            COLOR_TEXT_PRIMARY
+        } else {
+            COLOR_TEXT_SECONDARY
+        };
+
+        draw_rounded_rect(hdc, r.x, r.y, r.w, r.h, 6, bg_color, None);
+        draw_text(
+            hdc,
+            title,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            if is_active {
+                fonts.bold
+            } else {
+                fonts.regular
+            },
+            text_color,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+}
+
+fn render_tab_subtitles(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    state: &UiState,
+    fonts: &ThemeFonts,
+) {
+    // 1. Top Subtitle Track Selector dropdown
+    let sel_track = state
+        .tracks
+        .iter()
+        .find(|t| Some(t.id) == state.selected_extract_sub_id)
+        .or_else(|| state.tracks.iter().find(|t| t.selected))
+        .or_else(|| state.tracks.first());
+
+    let sel_r = &geom.sub_track_selector_rect;
+    let sel_hover = state.hovered_control == Some(HoverControl::SubTrackSelector);
+
+    draw_rounded_rect(
+        hdc,
+        sel_r.x,
+        sel_r.y,
+        sel_r.w,
+        sel_r.h,
+        6,
+        if sel_hover || state.sidebar_sub_dropdown_open {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_BG
+        },
+        Some(if sel_hover || state.sidebar_sub_dropdown_open {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+
+    let sel_text = if let Some(tr) = sel_track {
+        let lang = if !tr.lang.is_empty() {
+            tr.lang.to_uppercase()
+        } else {
+            "UND".to_string()
+        };
+        let title = if !tr.title.is_empty() {
+            tr.title.clone()
+        } else {
+            format!("Track {}", tr.id)
+        };
+        let codec = if !tr.codec.is_empty() {
+            tr.codec.to_uppercase()
+        } else {
+            "SUB".to_string()
+        };
+        format!("[{lang}] {title} ({codec})")
+    } else {
+        "No Subtitle Tracks Found".to_string()
+    };
+
+    draw_text(
+        hdc,
+        &sel_text,
+        sel_r.x + 8,
+        sel_r.y,
+        sel_r.w - 32,
+        sel_r.h,
+        fonts.small_bold,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+    draw_text(
+        hdc,
+        if state.sidebar_sub_dropdown_open { "▲" } else { "▼" },
+        sel_r.right() - 24,
+        sel_r.y,
+        20,
+        sel_r.h,
+        fonts.small,
+        COLOR_TEXT_SECONDARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    let is_bitmap = sel_track
+        .map(|t| {
+            let c = t.codec.to_lowercase();
+            c.contains("pgs") || c.contains("vobsub") || c.contains("hdmv")
+        })
+        .unwrap_or(false);
+
+    let list_r = &geom.subtitle_list_rect;
+
+    if is_bitmap {
+        draw_text(
+            hdc,
+            "Bitmap / PGS Subtitle Stream Selected\n\nLive text capture is unavailable for bitmap subtitles.\nUse 'Extract .SUP' below to export raw Blu-ray subtitles.",
+            list_r.x + 20,
+            list_r.y + 60,
+            list_r.w - 40,
+            90,
+            fonts.regular,
+            COLOR_TEXT_SECONDARY,
+            DT_CENTER | DT_WORDBREAK,
+        );
+    } else if state.cues.is_empty() {
+        draw_text(
+            hdc,
+            "No live subtitle cues captured yet.\nSubtitles appear here as video plays.",
+            list_r.x + 20,
+            list_r.y + 60,
+            list_r.w - 40,
+            60,
+            fonts.regular,
+            COLOR_TEXT_MUTED,
+            DT_CENTER | DT_WORDBREAK,
+        );
+    } else {
+        // Draw list of cue cards
+        let card_h = 70;
+        let card_margin = 8;
+        let mut y = list_r.y + 8 - state.sub_scroll_y;
+
+        for (idx, cue) in state.cues.iter().enumerate() {
+            if y + card_h >= list_r.y && y <= list_r.bottom() {
+                let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
+                let is_active = state.active_cue_idx == Some(idx);
+                let is_hover = state.hovered_control == Some(HoverControl::CueCard(idx));
+
+                let card_bg = if is_active {
+                    COLOR_CARD_ACTIVE
+                } else if is_hover {
+                    COLOR_SURFACE_HOVER
+                } else {
+                    COLOR_BG
+                };
+
+                let card_border = if is_active {
+                    Some(COLOR_ACCENT)
+                } else if is_hover {
+                    Some(COLOR_BORDER_HOVER)
+                } else {
+                    Some(COLOR_BORDER)
+                };
+
+                draw_rounded_rect(
+                    hdc,
+                    card_r.x,
+                    card_r.y,
+                    card_r.w,
+                    card_r.h,
+                    6,
+                    card_bg,
+                    card_border,
+                );
+
+                // Active cue highlight bar (vertical accent line)
+                if is_active {
+                    fill_rect(hdc, card_r.x + 2, card_r.y + 8, 3, card_r.h - 16, COLOR_ACCENT);
+                }
+
+                // Timestamp badge
+                let time_str = format_time(cue.timestamp);
+                let badge_x = card_r.x + 10;
+                let badge_y = card_r.y + 8;
+                let _bw = draw_badge(
+                    hdc,
+                    &time_str,
+                    badge_x,
+                    badge_y,
+                    fonts.mono,
+                    COLOR_SURFACE,
+                    Some(COLOR_BORDER),
+                    COLOR_ACCENT,
+                );
+
+                // Copy button on cue card
+                let copy_r = Rect::new(card_r.right() - 56, card_r.y + 8, 48, 20);
+                let is_copied = if let Some((c_idx, instant)) = state.copied_feedback {
+                    c_idx == idx && instant.elapsed().as_secs_f32() < 1.5
+                } else {
+                    false
+                };
+                let copy_hover = state.hovered_control == Some(HoverControl::CueCopy(idx));
+
+                let copy_label = if is_copied { "✓ Copied" } else { "Copy" };
+                draw_rounded_rect(
+                    hdc,
+                    copy_r.x,
+                    copy_r.y,
+                    copy_r.w,
+                    copy_r.h,
+                    4,
+                    if is_copied {
+                        COLOR_SUCCESS
+                    } else if copy_hover {
+                        COLOR_ACCENT
+                    } else {
+                        COLOR_SURFACE
+                    },
+                    Some(COLOR_BORDER),
+                );
+                draw_text(
+                    hdc,
+                    copy_label,
+                    copy_r.x,
+                    copy_r.y,
+                    copy_r.w,
+                    copy_r.h,
+                    fonts.small,
+                    if is_copied || copy_hover {
+                        COLOR_TEXT_PRIMARY
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Subtitle dialogue text
+                draw_text(
+                    hdc,
+                    &cue.text,
+                    card_r.x + 12,
+                    card_r.y + 32,
+                    card_r.w - 24,
+                    32,
+                    fonts.regular,
+                    if is_active {
+                        COLOR_TEXT_PRIMARY
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    },
+                    DT_LEFT | DT_WORDBREAK,
+                );
+            }
+            y += card_h + card_margin;
+        }
+    }
+
+    // Pinned footer button: Extract Subtitles (adaptive format)
+    let btn_r = &geom.btn_extract_ass;
+    let is_disabled = state.is_streaming_torrent && !state.is_torrent_complete;
+    let hover_extract = state.hovered_control == Some(HoverControl::ExtractAss);
+
+    let default_label = if is_bitmap {
+        "💾 Extract .SUP Subtitles"
+    } else if let Some(tr) = sel_track {
+        let c = tr.codec.to_lowercase();
+        if c.contains("srt") || c.contains("utf8") {
+            "💾 Extract .SRT Subtitles"
+        } else {
+            "💾 Extract .ASS (+ Fonts)"
+        }
+    } else {
+        "💾 Extract Subtitles"
+    };
+
+    let (bg_color, border_color, text_color, label) = if is_disabled {
+        (
+            COLOR_SURFACE_HOVER,
+            Some(COLOR_BORDER),
+            COLOR_TEXT_MUTED,
+            "Extract Subtitles (Torrent Incomplete)",
+        )
+    } else if hover_extract {
+        (
+            COLOR_ACCENT_HOVER,
+            Some(COLOR_ACCENT),
+            COLOR_TEXT_PRIMARY,
+            default_label,
+        )
+    } else {
+        (
+            COLOR_ACCENT,
+            Some(COLOR_ACCENT_MUTED),
+            COLOR_TEXT_PRIMARY,
+            default_label,
+        )
+    };
+
+    draw_rounded_rect(
+        hdc,
+        btn_r.x,
+        btn_r.y,
+        btn_r.w,
+        btn_r.h,
+        6,
+        bg_color,
+        border_color,
+    );
+    draw_text(
+        hdc,
+        label,
+        btn_r.x,
+        btn_r.y,
+        btn_r.w,
+        btn_r.h,
+        fonts.bold,
+        text_color,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Sidebar subtitle dropdown menu when open
+    if state.sidebar_sub_dropdown_open && !state.tracks.is_empty() {
+        let dd_x = geom.sub_track_selector_rect.x;
+        let dd_y = geom.sub_track_selector_rect.bottom() + 4;
+        let dd_w = geom.sub_track_selector_rect.w;
+        let item_h = 28;
+        let dd_h = ((state.tracks.len() as i32) * item_h).min(180);
+
+        draw_rounded_rect(
+            hdc,
+            dd_x,
+            dd_y,
+            dd_w,
+            dd_h,
+            6,
+            COLOR_SURFACE,
+            Some(COLOR_BORDER_HOVER),
+        );
+
+        for (idx, tr) in state.tracks.iter().enumerate().take(6) {
+            let row_y = dd_y + (idx as i32) * item_h;
+            let is_item_hover =
+                state.hovered_control == Some(HoverControl::SubTrackSelectorItem(idx));
+            if is_item_hover {
+                draw_rounded_rect(
+                    hdc,
+                    dd_x + 2,
+                    row_y + 2,
+                    dd_w - 4,
+                    item_h - 4,
+                    4,
+                    COLOR_SURFACE_HOVER,
+                    None,
+                );
+            }
+            let is_sel = Some(tr.id) == state.selected_extract_sub_id;
+            let bullet = if is_sel { "● " } else { "   " };
+            let lang = if !tr.lang.is_empty() {
+                tr.lang.to_uppercase()
+            } else {
+                "UND".to_string()
+            };
+            let title = if !tr.title.is_empty() {
+                tr.title.clone()
+            } else {
+                format!("Track {}", tr.id)
+            };
+            let codec = if !tr.codec.is_empty() {
+                tr.codec.to_uppercase()
+            } else {
+                "SUB".to_string()
+            };
+            let item_text = format!("{bullet}[{lang}] {title} ({codec})");
+
+            draw_text(
+                hdc,
+                &item_text,
+                dd_x + 8,
+                row_y,
+                dd_w - 16,
+                item_h,
+                if is_sel {
+                    fonts.bold
+                } else {
+                    fonts.regular
+                },
+                if is_sel {
+                    COLOR_ACCENT
+                } else if is_item_hover {
+                    COLOR_TEXT_PRIMARY
+                } else {
+                    COLOR_TEXT_SECONDARY
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+fn render_toast(hdc: HDC, geom: &LayoutGeometry, msg: &str, fonts: &ThemeFonts) {
+    let (tw, th) = measure_text(hdc, msg, fonts.regular);
+    let pad_x = 16;
+    let pad_y = 6;
+    let toast_w = (tw + pad_x * 2).max(220).min(geom.video_rect.w - 32);
+    let toast_h = (th + pad_y * 2).max(32);
+    let toast_x = geom.video_rect.x + (geom.video_rect.w - toast_w) / 2;
+    let toast_y = (geom.video_rect.bottom() - toast_h - 16).max(10);
+
+    let is_error = msg.to_lowercase().contains("error") || msg.to_lowercase().contains("failed");
+    let border_color = if is_error { COLOR_ERROR } else { COLOR_ACCENT };
+    let text_color = if is_error { COLOR_ERROR } else { COLOR_TEXT_PRIMARY };
+
+    draw_rounded_rect(
+        hdc,
+        toast_x,
+        toast_y,
+        toast_w,
+        toast_h,
+        6,
+        COLOR_SURFACE,
+        Some(border_color),
+    );
+
+    draw_text(
+        hdc,
+        msg,
+        toast_x + pad_x,
+        toast_y + pad_y,
+        toast_w - pad_x * 2,
+        th,
+        fonts.regular,
+        text_color,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+}
+
+fn render_tab_episodes(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    state: &UiState,
+    fonts: &ThemeFonts,
+) {
+    // Open Folder header button
+    let ep_header_r = &geom.ep_header_open_folder;
+    let ep_hdr_hover = state.hovered_control == Some(HoverControl::EpisodesOpenFolder);
+    draw_rounded_rect(
+        hdc,
+        ep_header_r.x,
+        ep_header_r.y,
+        ep_header_r.w,
+        ep_header_r.h,
+        6,
+        if ep_hdr_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(if ep_hdr_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    draw_text(
+        hdc,
+        "📁 Open Folder",
+        ep_header_r.x,
+        ep_header_r.y,
+        ep_header_r.w,
+        ep_header_r.h,
+        fonts.bold,
+        if ep_hdr_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_TEXT_PRIMARY
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    let list_r = &geom.episode_list_rect;
+
+    if state.episodes.is_empty() {
+        draw_text(
+            hdc,
+            "No anime folder loaded.\nOpen a season directory to list episodes:",
+            list_r.x + 20,
+            list_r.y + 36,
+            list_r.w - 40,
+            44,
+            fonts.regular,
+            COLOR_TEXT_MUTED,
+            DT_CENTER | DT_WORDBREAK,
+        );
+
+        let ep_btn = &geom.ep_empty_open_folder;
+        let ep_btn_hover = state.hovered_control == Some(HoverControl::EpisodesOpenFolder);
+        draw_rounded_rect(
+            hdc,
+            ep_btn.x,
+            ep_btn.y,
+            ep_btn.w,
+            ep_btn.h,
+            6,
+            if ep_btn_hover {
+                COLOR_ACCENT_HOVER
+            } else {
+                COLOR_ACCENT
+            },
+            Some(COLOR_ACCENT_MUTED),
+        );
+        draw_text(
+            hdc,
+            "📁 Choose Folder",
+            ep_btn.x,
+            ep_btn.y,
+            ep_btn.w,
+            ep_btn.h,
+            fonts.bold,
+            COLOR_TEXT_PRIMARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        return;
+    }
+
+    let item_h = 56;
+    let item_margin = 6;
+    let mut y = list_r.y + 8 - state.ep_scroll_y;
+
+    for (idx, ep) in state.episodes.iter().enumerate() {
+        if y + item_h >= list_r.y && y <= list_r.bottom() {
+            let row_r = Rect::new(list_r.x + 12, y, list_r.w - 24, item_h);
+            let is_active = state.active_ep_idx == Some(idx);
+            let is_hover = state.hovered_control == Some(HoverControl::Episode(idx));
+
+            let bg_color = if is_active {
+                COLOR_CARD_ACTIVE
+            } else if is_hover {
+                COLOR_SURFACE_HOVER
+            } else {
+                COLOR_BG
+            };
+
+            let border_color = if is_active {
+                Some(COLOR_ACCENT)
+            } else if is_hover {
+                Some(COLOR_BORDER_HOVER)
+            } else {
+                Some(COLOR_BORDER)
+            };
+
+            draw_rounded_rect(
+                hdc,
+                row_r.x,
+                row_r.y,
+                row_r.w,
+                row_r.h,
+                6,
+                bg_color,
+                border_color,
+            );
+
+            // Episode number badge
+            let ep_badge = if let Some(num) = ep.episode_number {
+                format!("EP {:02}", num as u32)
+            } else {
+                format!("EP {:02}", idx + 1)
+            };
+
+            let _bw = draw_badge(
+                hdc,
+                &ep_badge,
+                row_r.x + 10,
+                row_r.y + 8,
+                fonts.small_bold,
+                COLOR_SURFACE,
+                Some(COLOR_BORDER),
+                if is_active {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_SECONDARY
+                },
+            );
+
+            // Clean title
+            draw_text(
+                hdc,
+                &ep.clean_title,
+                row_r.x + 10,
+                row_r.y + 28,
+                row_r.w - 20,
+                22,
+                fonts.bold,
+                if is_active {
+                    COLOR_TEXT_PRIMARY
+                } else {
+                    COLOR_TEXT_SECONDARY
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        y += item_h + item_margin;
+    }
+}
+
+fn render_tab_nyaa(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &ThemeFonts) {
+    // Search input
+    let si = &geom.nyaa_search_input;
+    let is_focused = state.search_focused;
+    draw_rounded_rect(
+        hdc,
+        si.x,
+        si.y,
+        si.w,
+        si.h,
+        6,
+        COLOR_BG,
+        Some(if is_focused {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+
+    let display_query = if state.search_query.is_empty() && !is_focused {
+        "Search anime on Nyaa..."
+    } else {
+        &state.search_query
+    };
+    let text_color = if state.search_query.is_empty() && !is_focused {
+        COLOR_TEXT_MUTED
+    } else {
+        COLOR_TEXT_PRIMARY
+    };
+
+    let mut query_with_cursor = state.search_query.clone();
+    if is_focused {
+        query_with_cursor.push('|');
+    }
+
+    draw_text(
+        hdc,
+        if is_focused {
+            &query_with_cursor
+        } else {
+            display_query
+        },
+        si.x + 8,
+        si.y,
+        si.w - 16,
+        si.h,
+        fonts.regular,
+        text_color,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Search button
+    let sb = &geom.nyaa_search_btn;
+    let sb_hover = state.hovered_control == Some(HoverControl::NyaaSearchBtn);
+    draw_rounded_rect(
+        hdc,
+        sb.x,
+        sb.y,
+        sb.w,
+        sb.h,
+        6,
+        if sb_hover {
+            COLOR_ACCENT_HOVER
+        } else {
+            COLOR_ACCENT
+        },
+        Some(COLOR_ACCENT_MUTED),
+    );
+    draw_text(
+        hdc,
+        if state.searching { "..." } else { "Search" },
+        sb.x,
+        sb.y,
+        sb.w,
+        sb.h,
+        fonts.bold,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Filters row: Trusted Only checkbox + Category dropdown
+    let cb = &geom.nyaa_trusted_checkbox;
+    let cb_hover = state.hovered_control == Some(HoverControl::NyaaTrustedCheckbox);
+    let box_size = 14;
+    let box_y = cb.y + (cb.h - box_size) / 2;
+    draw_rounded_rect(
+        hdc,
+        cb.x,
+        box_y,
+        box_size,
+        box_size,
+        3,
+        if state.trusted_only {
+            COLOR_ACCENT
+        } else {
+            COLOR_BG
+        },
+        Some(if cb_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    if state.trusted_only {
+        draw_text(
+            hdc,
+            "✓",
+            cb.x,
+            box_y - 1,
+            box_size,
+            box_size,
+            fonts.small_bold,
+            COLOR_TEXT_PRIMARY,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+    draw_text(
+        hdc,
+        "Trusted Only",
+        cb.x + box_size + 6,
+        cb.y,
+        cb.w - box_size - 6,
+        cb.h,
+        fonts.small,
+        if cb_hover {
+            COLOR_TEXT_PRIMARY
+        } else {
+            COLOR_TEXT_SECONDARY
+        },
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Category dropdown selector
+    let dd = &geom.nyaa_category_dropdown;
+    let dd_hover = state.hovered_control == Some(HoverControl::NyaaCategoryDropdown);
+    draw_rounded_rect(
+        hdc,
+        dd.x,
+        dd.y,
+        dd.w,
+        dd.h,
+        4,
+        COLOR_SURFACE_HOVER,
+        Some(if dd_hover {
+            COLOR_ACCENT
+        } else {
+            COLOR_BORDER
+        }),
+    );
+    let cat_label = match state.category {
+        NyaaCategory::AnimeEng => "Anime - Eng ▾",
+        NyaaCategory::AllAnime => "All Anime ▾",
+        NyaaCategory::AnimeRaw => "Anime - Raw ▾",
+    };
+    draw_text(
+        hdc,
+        cat_label,
+        dd.x + 6,
+        dd.y,
+        dd.w - 12,
+        dd.h,
+        fonts.small_bold,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Results list
+    let list_r = &geom.nyaa_results_list;
+
+    if state.searching {
+        draw_text(
+            hdc,
+            "Searching Nyaa...",
+            list_r.x + 20,
+            list_r.y + 40,
+            list_r.w - 40,
+            30,
+            fonts.regular,
+            COLOR_ACCENT,
+            DT_CENTER | DT_SINGLELINE,
+        );
+        return;
+    }
+
+    if let Some(ref err) = state.nyaa_error {
+        draw_text(
+            hdc,
+            err,
+            list_r.x + 20,
+            list_r.y + 40,
+            list_r.w - 40,
+            60,
+            fonts.regular,
+            COLOR_ERROR,
+            DT_CENTER | DT_WORDBREAK,
+        );
+        return;
+    }
+
+    if state.nyaa_results.is_empty() {
+        draw_text(
+            hdc,
+            "Enter keywords to search Nyaa anime releases or paste a direct HTTP/HTTPS/HLS stream URL.",
+            list_r.x + 20,
+            list_r.y + 40,
+            list_r.w - 40,
+            50,
+            fonts.regular,
+            COLOR_TEXT_MUTED,
+            DT_CENTER | DT_WORDBREAK,
+        );
+        return;
+    }
+
+    let item_h = 68;
+    let item_margin = 6;
+    let mut y = list_r.y + 4 - state.nyaa_scroll_y;
+
+    for (idx, item) in state.nyaa_results.iter().enumerate() {
+        if y + item_h >= list_r.y && y <= list_r.bottom() {
+            let row_r = Rect::new(list_r.x + 12, y, list_r.w - 24, item_h);
+            let is_hover = state.hovered_control == Some(HoverControl::NyaaResult(idx));
+
+            let bg_color = if is_hover {
+                COLOR_SURFACE_HOVER
+            } else {
+                COLOR_BG
+            };
+            let border_color = if is_hover {
+                Some(COLOR_ACCENT)
+            } else {
+                Some(COLOR_BORDER)
+            };
+
+            draw_rounded_rect(
+                hdc,
+                row_r.x,
+                row_r.y,
+                row_r.w,
+                row_r.h,
+                6,
+                bg_color,
+                border_color,
+            );
+
+            // Clean title
+            draw_text(
+                hdc,
+                &item.clean_title,
+                row_r.x + 10,
+                row_r.y + 8,
+                row_r.w - 20,
+                24,
+                fonts.bold,
+                if is_hover {
+                    COLOR_TEXT_PRIMARY
+                } else {
+                    COLOR_TEXT_SECONDARY
+                },
+                DT_LEFT | DT_WORDBREAK,
+            );
+
+            // Size badge
+            let bw = draw_badge(
+                hdc,
+                &item.size,
+                row_r.x + 10,
+                row_r.y + 36,
+                fonts.small,
+                COLOR_SURFACE,
+                Some(COLOR_BORDER),
+                COLOR_TEXT_MUTED,
+            );
+
+            // Seeders badge (Green)
+            let s_text = format!("▲ {}", item.seeders);
+            let sw = draw_badge(
+                hdc,
+                &s_text,
+                row_r.x + 14 + bw,
+                row_r.y + 36,
+                fonts.small_bold,
+                COLOR_SURFACE,
+                Some(COLOR_BORDER),
+                COLOR_SUCCESS,
+            );
+
+            // Leechers badge (Red)
+            let l_text = format!("▼ {}", item.leechers);
+            draw_badge(
+                hdc,
+                &l_text,
+                row_r.x + 18 + bw + sw,
+                row_r.y + 36,
+                fonts.small,
+                COLOR_SURFACE,
+                Some(COLOR_BORDER),
+                COLOR_ERROR,
+            );
+        }
+        y += item_h + item_margin;
+    }
+
+    // Category dropdown popup menu overlay
+    if state.category_dropdown_open {
+        let menu_x = dd.x;
+        let menu_y = dd.bottom() + 4;
+        let menu_w = dd.w;
+        let item_h = 24;
+        let menu_h = item_h * 3;
+
+        draw_rounded_rect(
+            hdc,
+            menu_x,
+            menu_y,
+            menu_w,
+            menu_h,
+            4,
+            COLOR_SURFACE,
+            Some(COLOR_ACCENT),
+        );
+
+        let cats = [
+            (NyaaCategory::AnimeEng, "Anime - Eng"),
+            (NyaaCategory::AllAnime, "All Anime"),
+            (NyaaCategory::AnimeRaw, "Anime - Raw"),
+        ];
+
+        for (i, (c, title)) in cats.iter().enumerate() {
+            let item_y = menu_y + (i as i32) * item_h;
+            let is_sel = state.category == *c;
+            let is_hover = state.hovered_control == Some(HoverControl::NyaaCategoryItem(i));
+
+            if is_hover || is_sel {
+                fill_rect(
+                    hdc,
+                    menu_x + 2,
+                    item_y,
+                    menu_w - 4,
+                    item_h,
+                    if is_sel {
+                        COLOR_CARD_ACTIVE
+                    } else {
+                        COLOR_SURFACE_HOVER
+                    },
+                );
+            }
+
+            draw_text(
+                hdc,
+                title,
+                menu_x + 6,
+                item_y,
+                menu_w - 12,
+                item_h,
+                if is_sel {
+                    fonts.small_bold
+                } else {
+                    fonts.small
+                },
+                if is_sel {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_TEXT_PRIMARY
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+    }
+}
+
+fn render_batch_modal(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    files: &[TorrentFileInfo],
+    selected_idx: usize,
+    fonts: &ThemeFonts,
+    state: &UiState,
+) {
+    let modal_w = 480.min(geom.total_width - 40);
+    let modal_h = 360.min(geom.total_height - 60);
+    let modal_x = (geom.total_width - modal_w) / 2;
+    let modal_y = (geom.total_height - modal_h) / 2;
+
+    // Semi-translucent dark background
+    draw_rounded_rect(
+        hdc,
+        modal_x,
+        modal_y,
+        modal_w,
+        modal_h,
+        8,
+        COLOR_SURFACE,
+        Some(COLOR_ACCENT),
+    );
+
+    // Header
+    draw_text(
+        hdc,
+        "Batch Torrent — Select Episode to Play",
+        modal_x + 16,
+        modal_y + 12,
+        modal_w - 32,
+        24,
+        fonts.heading,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_SINGLELINE,
+    );
+
+    // File list
+    let list_y = modal_y + 44;
+    let _list_h = modal_h - 96;
+    let item_h = 36;
+
+    for (idx, file) in files.iter().enumerate().take(8) {
+        let row_y = list_y + (idx as i32) * item_h;
+        let is_sel = selected_idx == idx;
+        let is_hover = state.hovered_control == Some(HoverControl::BatchFile(idx));
+
+        let bg = if is_sel {
+            COLOR_CARD_ACTIVE
+        } else if is_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_BG
+        };
+
+        draw_rounded_rect(
+            hdc,
+            modal_x + 16,
+            row_y,
+            modal_w - 32,
+            item_h - 4,
+            4,
+            bg,
+            if is_sel {
+                Some(COLOR_ACCENT)
+            } else {
+                Some(COLOR_BORDER)
+            },
+        );
+
+        let size_str = format!("{:.1} MB", (file.size_bytes as f64) / (1024.0 * 1024.0));
+        draw_text(
+            hdc,
+            &file.path,
+            modal_x + 24,
+            row_y,
+            modal_w - 120,
+            item_h - 4,
+            fonts.regular,
+            COLOR_TEXT_PRIMARY,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+        draw_text(
+            hdc,
+            &size_str,
+            modal_x + modal_w - 100,
+            row_y,
+            80,
+            item_h - 4,
+            fonts.small,
+            COLOR_TEXT_MUTED,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+
+    // Modal buttons: Play and Cancel
+    let btn_y = modal_y + modal_h - 42;
+    let btn_w = 90;
+    let play_btn_x = modal_x + modal_w - 16 - btn_w;
+    let cancel_btn_x = play_btn_x - 12 - btn_w;
+
+    // Play button
+    let play_hover = state.hovered_control == Some(HoverControl::BatchConfirm);
+    draw_rounded_rect(
+        hdc,
+        play_btn_x,
+        btn_y,
+        btn_w,
+        30,
+        4,
+        if play_hover {
+            COLOR_ACCENT_HOVER
+        } else {
+            COLOR_ACCENT
+        },
+        Some(COLOR_ACCENT_MUTED),
+    );
+    draw_text(
+        hdc,
+        "Play Stream",
+        play_btn_x,
+        btn_y,
+        btn_w,
+        30,
+        fonts.bold,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Cancel button
+    let cancel_hover = state.hovered_control == Some(HoverControl::BatchCancel);
+    draw_rounded_rect(
+        hdc,
+        cancel_btn_x,
+        btn_y,
+        btn_w,
+        30,
+        4,
+        if cancel_hover {
+            COLOR_SURFACE_HOVER
+        } else {
+            COLOR_SURFACE
+        },
+        Some(COLOR_BORDER),
+    );
+    draw_text(
+        hdc,
+        "Cancel",
+        cancel_btn_x,
+        btn_y,
+        btn_w,
+        30,
+        fonts.regular,
+        COLOR_TEXT_SECONDARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+fn render_tooltip(hdc: HDC, text: &str, tx: i32, ty: i32, fonts: &ThemeFonts) {
+    let (tw, th) = measure_text(hdc, text, fonts.small);
+    let pad_x = 8;
+    let pad_y = 4;
+    let w = tw + pad_x * 2;
+    let h = th + pad_y * 2;
+    let x = (tx - w / 2).max(10);
+    let y = ty - h - 8;
+
+    draw_rounded_rect(hdc, x, y, w, h, 4, COLOR_SURFACE, Some(COLOR_ACCENT));
+    draw_text(
+        hdc,
+        text,
+        x + pad_x,
+        y + pad_y,
+        tw,
+        th,
+        fonts.small,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}

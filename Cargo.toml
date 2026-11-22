@@ -1,0 +1,67 @@
+[package]
+name = "vesper"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vesper Developers"]
+description = "Lightweight Windows Anime MKV Player & Subtitle Extractor"
+
+[dependencies]
+# Video Engine
+libmpv2 = "7.0.1"
+
+# Windowing & Native Win32 UI
+winit = "0.29.15"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+] }
+
+# Async & Networking
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+urlencoding = "2.1"
+toml = "0.8"
+
+# Torrent Streaming (Optional - compile with --features torrent)
+librqbit = { version = "9.1.0", features = ["http-api", "tracing-subscriber-utils"], optional = true }
+librqbit-dualstack-sockets = { version = "0.7.0", optional = true }
+
+# Subtitles & MKV Parsing
+matroska = "0.30.1"
+matroska-demuxer = "0.8.1"
+arboard = "3.4"
+rfd = "0.15"
+
+# Utilities & Logging
+parking_lot = "0.12"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = []
+torrent = ["dep:librqbit", "dep:librqbit-dualstack-sockets"]
+
+[build-dependencies]
+winres = "0.1.12"
+
+[profile.release]
+opt-level = 2
+lto = false
+strip = false
+debug = "line-tables-only"

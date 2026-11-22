@@ -1,0 +1,30 @@
+# Build output & binaries
+target/
+*.exe
+*.zip
+
+# Windows runtime DLLs & import libraries
+libmpv-2.dll
+libs/libmpv-2.dll
+libs/libmpv.dll.a
+libs/mpv.lib
+
+# Media & extracted subtitles
+*.mkv
+*.mp4
+*.webm
+*.avi
+*.ass
+*.srt
+*.sup
+*.ttf
+*.otf
+*.torrent
+
+# Configuration & runtime data
+vesper.toml
+*.log
+vesper-cache/
+temp/
+cache/
+.system_generated/
