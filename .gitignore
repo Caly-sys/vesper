@@ -12,6 +12,7 @@
 *.dll
 *.lib
 *.exp
+*.a
 libs/mpv.lib
 libs/libmpv-2.dll
 
