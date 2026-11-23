@@ -76,6 +76,34 @@ pub enum HoverControl {
     TrackersModalCustomInput,
     TrackersModalSave,
     TrackersModalReset,
+    FetchSubs,
+    SubSettings,
+    SubModalClose,
+    SubModalAutoFetchToggle,
+    SubModalLangInput,
+    SubModalOpenSubKeyInput,
+    SubModalJimakuKeyInput,
+    SubModalRegisterAssoc,
+    SubModalSave,
+    AttachFetchedSub(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubModalFocusedField {
+    None,
+    Lang,
+    OpenSubKey,
+    JimakuKey,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubtitleSettingsModalState {
+    pub auto_fetch: bool,
+    pub preferred_lang: String,
+    pub opensubtitles_key: String,
+    pub jimaku_key: String,
+    pub focused_field: SubModalFocusedField,
+    pub status_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,12 +191,19 @@ pub struct UiState {
 
     // Trackers configuration modal & pool
     pub trackers_modal: Option<TrackersModalState>,
+    pub sub_settings_modal: Option<SubtitleSettingsModalState>,
+    pub auto_fetch_subs: bool,
+    pub preferred_sub_lang: String,
+    pub jimaku_api_key: Option<String>,
+    pub opensubtitles_api_key: Option<String>,
     pub auto_sync_trackers: bool,
     pub tracker_list_url: String,
     pub custom_trackers: Vec<String>,
     pub cached_remote_trackers: Vec<String>,
     pub completed_hashes: HashSet<String>,
     pub watch_progress_keys: std::collections::HashMap<String, f64>,
+    pub fetched_subtitles: Vec<crate::subtitles::SubtitleSearchResult>,
+    pub is_searching_subs: bool,
 
     // Interaction
     pub hovered_control: Option<HoverControl>,
@@ -240,12 +275,19 @@ impl Default for UiState {
             batch_modal: None,
 
             trackers_modal: None,
+            sub_settings_modal: None,
+            auto_fetch_subs: true,
+            preferred_sub_lang: "en".to_string(),
+            jimaku_api_key: None,
+            opensubtitles_api_key: None,
             auto_sync_trackers: true,
             tracker_list_url: crate::config::default_tracker_list_url(),
             custom_trackers: Vec::new(),
             cached_remote_trackers: Vec::new(),
             completed_hashes: HashSet::new(),
             watch_progress_keys: std::collections::HashMap::new(),
+            fetched_subtitles: Vec::new(),
+            is_searching_subs: false,
 
             hovered_control: None,
             is_dragging_seekbar: false,
@@ -674,6 +716,8 @@ pub fn render_ui(hdc: HDC, geom: &LayoutGeometry, state: &UiState, fonts: &Theme
         render_batch_modal(hdc, geom, modal, fonts, state);
     } else if let Some(ref modal) = state.trackers_modal {
         render_trackers_modal(hdc, geom, modal, fonts, state);
+    } else if let Some(ref modal) = state.sub_settings_modal {
+        render_subtitle_settings_modal(hdc, geom, modal, fonts, state);
     }
 
     // 6. Render active tooltip
@@ -1292,6 +1336,56 @@ fn render_tab_subtitles(
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
 
+    // Fetch Subtitles button
+    let fetch_r = &geom.btn_fetch_subs;
+    let is_fetch_hover = state.hovered_control == Some(HoverControl::FetchSubs);
+    draw_rounded_rect(
+        hdc,
+        fetch_r.x,
+        fetch_r.y,
+        fetch_r.w,
+        fetch_r.h,
+        4,
+        if is_fetch_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_fetch_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "Fetch Subtitles",
+        fetch_r.x,
+        fetch_r.y,
+        fetch_r.w,
+        fetch_r.h,
+        fonts.small_bold,
+        if is_fetch_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Subtitle & Association Settings button (gear)
+    let set_r = &geom.btn_sub_settings;
+    let is_set_hover = state.hovered_control == Some(HoverControl::SubSettings);
+    draw_rounded_rect(
+        hdc,
+        set_r.x,
+        set_r.y,
+        set_r.w,
+        set_r.h,
+        4,
+        if is_set_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_set_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "⚙",
+        set_r.x,
+        set_r.y - 1,
+        set_r.w,
+        set_r.h,
+        fonts.regular,
+        if is_set_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
     let is_bitmap = sel_track
         .map(|t| {
             let c = t.codec.to_lowercase();
@@ -1300,23 +1394,179 @@ fn render_tab_subtitles(
         .unwrap_or(false);
 
     let list_r = &geom.subtitle_list_rect;
+    let mut y = list_r.y + 8 - state.sub_scroll_y;
+
+    // 1. Searching indicator banner
+    if state.is_searching_subs {
+        let search_r = Rect::new(list_r.x + 12, y, list_r.w - 24, 34);
+        draw_rounded_rect(
+            hdc,
+            search_r.x,
+            search_r.y,
+            search_r.w,
+            search_r.h,
+            6,
+            COLOR_SURFACE,
+            Some(COLOR_ACCENT),
+        );
+        draw_text(
+            hdc,
+            "Searching AnimeTosho & OpenSubtitles...",
+            search_r.x + 8,
+            search_r.y,
+            search_r.w - 16,
+            search_r.h,
+            fonts.small_bold,
+            COLOR_ACCENT,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        y += 42;
+    }
+
+    // 2. Fetched Online Subtitles
+    if !state.fetched_subtitles.is_empty() {
+        let sec_hdr_r = Rect::new(list_r.x + 14, y, list_r.w - 28, 20);
+        draw_text(
+            hdc,
+            &format!("ONLINE SUBTITLES ({})", state.fetched_subtitles.len()),
+            sec_hdr_r.x,
+            sec_hdr_r.y,
+            sec_hdr_r.w,
+            sec_hdr_r.h,
+            fonts.small_bold,
+            COLOR_TEXT_MUTED,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+        y += 24;
+
+        let card_h = 52;
+        let card_margin = 6;
+        for (idx, sub) in state.fetched_subtitles.iter().enumerate() {
+            if y + card_h >= list_r.y && y <= list_r.bottom() {
+                let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
+                let is_hover = state.hovered_control == Some(HoverControl::AttachFetchedSub(idx));
+
+                let card_bg = if is_hover { COLOR_SURFACE_HOVER } else { COLOR_BG };
+                let card_border = if is_hover { Some(COLOR_ACCENT) } else { Some(COLOR_BORDER) };
+                draw_rounded_rect(hdc, card_r.x, card_r.y, card_r.w, card_r.h, 6, card_bg, card_border);
+
+                // Language badge
+                let lang_display = sub.lang.to_uppercase();
+                let badge_x = card_r.x + 8;
+                let badge_y = card_r.y + 6;
+                let bw = draw_badge(
+                    hdc,
+                    &lang_display,
+                    badge_x,
+                    badge_y,
+                    fonts.mono,
+                    COLOR_SURFACE,
+                    Some(COLOR_ACCENT),
+                    COLOR_ACCENT,
+                );
+
+                // Format badge
+                let fmt_badge_x = badge_x + bw + 4;
+                let fmt_bw = draw_badge(
+                    hdc,
+                    &sub.format,
+                    fmt_badge_x,
+                    badge_y,
+                    fonts.mono,
+                    COLOR_SURFACE,
+                    Some(COLOR_BORDER),
+                    COLOR_TEXT_SECONDARY,
+                );
+
+                // Provider label
+                let prov_x = fmt_badge_x + fmt_bw + 6;
+                let prov_w = (card_r.right() - 62 - prov_x).max(20);
+                draw_text(
+                    hdc,
+                    &sub.provider,
+                    prov_x,
+                    badge_y,
+                    prov_w,
+                    18,
+                    fonts.small,
+                    COLOR_TEXT_MUTED,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Attach button on the right
+                let attach_r = Rect::new(card_r.right() - 58, card_r.y + 14, 50, 24);
+                draw_rounded_rect(
+                    hdc,
+                    attach_r.x,
+                    attach_r.y,
+                    attach_r.w,
+                    attach_r.h,
+                    4,
+                    if is_hover { COLOR_ACCENT } else { COLOR_SURFACE },
+                    Some(COLOR_ACCENT),
+                );
+                draw_text(
+                    hdc,
+                    "Attach",
+                    attach_r.x,
+                    attach_r.y,
+                    attach_r.w,
+                    attach_r.h,
+                    fonts.small_bold,
+                    if is_hover { COLOR_TEXT_PRIMARY } else { COLOR_ACCENT },
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                // Subtitle filename
+                draw_text(
+                    hdc,
+                    &sub.title,
+                    card_r.x + 8,
+                    card_r.y + 26,
+                    card_r.w - 70,
+                    22,
+                    fonts.small,
+                    COLOR_TEXT_PRIMARY,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
+            y += card_h + card_margin;
+        }
+
+        if !state.cues.is_empty() {
+            y += 8;
+            let cues_hdr_r = Rect::new(list_r.x + 14, y, list_r.w - 28, 20);
+            draw_text(
+                hdc,
+                &format!("LIVE CUES ({})", state.cues.len()),
+                cues_hdr_r.x,
+                cues_hdr_r.y,
+                cues_hdr_r.w,
+                cues_hdr_r.h,
+                fonts.small_bold,
+                COLOR_TEXT_MUTED,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            y += 24;
+        }
+    }
 
     if is_bitmap {
         draw_text(
             hdc,
             "Bitmap / PGS Subtitle Stream Selected\n\nLive text capture is unavailable for bitmap subtitles.\nUse 'Extract .SUP' below to export raw Blu-ray subtitles.",
             list_r.x + 20,
-            list_r.y + 60,
+            y + 30,
             list_r.w - 40,
             90,
             fonts.regular,
             COLOR_TEXT_SECONDARY,
             DT_CENTER | DT_WORDBREAK,
         );
-    } else if state.cues.is_empty() {
+    } else if state.cues.is_empty() && state.fetched_subtitles.is_empty() && !state.is_searching_subs {
         draw_text(
             hdc,
-            "No live subtitle cues captured yet.\nSubtitles appear here as video plays.",
+            "No live subtitle cues captured yet.\nSubtitles appear here as video plays,\nor click 'Fetch Subtitles' above.",
             list_r.x + 20,
             list_r.y + 60,
             list_r.w - 40,
@@ -1325,11 +1575,10 @@ fn render_tab_subtitles(
             COLOR_TEXT_MUTED,
             DT_CENTER | DT_WORDBREAK,
         );
-    } else {
+    } else if !state.cues.is_empty() {
         // Draw list of cue cards
         let card_h = 70;
         let card_margin = 8;
-        let mut y = list_r.y + 8 - state.sub_scroll_y;
 
         for (idx, cue) in state.cues.iter().enumerate() {
             if y + card_h >= list_r.y && y <= list_r.bottom() {
@@ -3985,6 +4234,248 @@ fn render_tooltip(hdc: HDC, text: &str, tx: i32, ty: i32, fonts: &ThemeFonts) {
         tw,
         th,
         fonts.small,
+        COLOR_TEXT_PRIMARY,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+fn render_subtitle_settings_modal(
+    hdc: HDC,
+    geom: &LayoutGeometry,
+    modal: &SubtitleSettingsModalState,
+    fonts: &ThemeFonts,
+    state: &UiState,
+) {
+    let modal_w = 520.min(geom.total_width - 40);
+    let modal_h = 420.min(geom.total_height - 60);
+    let modal_x = (geom.total_width - modal_w) / 2;
+    let modal_y = (geom.total_height - modal_h) / 2;
+
+    // Dark dimming backdrop
+    fill_rect(hdc, 0, 0, geom.total_width, geom.total_height, COLOR_VIEWPORT_BG);
+
+    // Modal container
+    draw_rounded_rect(
+        hdc,
+        modal_x,
+        modal_y,
+        modal_w,
+        modal_h,
+        8,
+        COLOR_SURFACE,
+        Some(COLOR_BORDER),
+    );
+
+    // Header close button
+    let close_btn_w = 26;
+    let close_btn_h = 24;
+    let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+    let close_btn_y = modal_y + 12;
+    let is_close_hover = state.hovered_control == Some(HoverControl::SubModalClose);
+    draw_rounded_rect(
+        hdc,
+        close_btn_x,
+        close_btn_y,
+        close_btn_w,
+        close_btn_h,
+        4,
+        if is_close_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_close_hover { COLOR_ERROR } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "×",
+        close_btn_x,
+        close_btn_y - 1,
+        close_btn_w,
+        close_btn_h,
+        fonts.bold,
+        if is_close_hover { COLOR_ERROR } else { COLOR_TEXT_MUTED },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Header badge & title
+    let bw = draw_badge(
+        hdc,
+        "SUBTITLES",
+        modal_x + 16,
+        modal_y + 14,
+        fonts.small_bold,
+        COLOR_BG,
+        Some(COLOR_ACCENT),
+        COLOR_ACCENT,
+    );
+    draw_text(
+        hdc,
+        "Subtitle & Integration Settings",
+        modal_x + 24 + bw,
+        modal_y + 12,
+        modal_w - 60 - bw,
+        22,
+        fonts.bold,
+        COLOR_TEXT_PRIMARY,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // 1. Auto-fetch checkbox
+    let chk_x = modal_x + 18;
+    let chk_y = modal_y + 52;
+    let chk_w = 16;
+    let chk_h = 16;
+    let is_chk_hover = state.hovered_control == Some(HoverControl::SubModalAutoFetchToggle);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        chk_y,
+        chk_w,
+        chk_h,
+        3,
+        if modal.auto_fetch { COLOR_ACCENT } else { COLOR_BG },
+        Some(if is_chk_hover { COLOR_ACCENT_HOVER } else { COLOR_BORDER }),
+    );
+    if modal.auto_fetch {
+        draw_text(hdc, "✓", chk_x, chk_y - 1, chk_w, chk_h, fonts.small_bold, COLOR_TEXT_PRIMARY, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    draw_text(
+        hdc,
+        "Auto-fetch external subtitles if no embedded tracks exist",
+        chk_x + chk_w + 10,
+        chk_y - 2,
+        modal_w - 60,
+        20,
+        fonts.regular,
+        if is_chk_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // 2. Preferred language
+    let lang_lbl_y = modal_y + 82;
+    draw_text(hdc, "Preferred Subtitle Language (e.g. en, ja, id, es, fr):", chk_x, lang_lbl_y, modal_w - 36, 18, fonts.small, COLOR_TEXT_SECONDARY, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    let lang_box_y = lang_lbl_y + 20;
+    let lang_box_w = 120;
+    let lang_box_h = 26;
+    let is_lang_focused = modal.focused_field == SubModalFocusedField::Lang;
+    let is_lang_hover = state.hovered_control == Some(HoverControl::SubModalLangInput);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        lang_box_y,
+        lang_box_w,
+        lang_box_h,
+        4,
+        COLOR_BG,
+        Some(if is_lang_focused { COLOR_ACCENT } else if is_lang_hover { COLOR_BORDER_HOVER } else { COLOR_BORDER }),
+    );
+    let lang_display = if is_lang_focused { format!("{}|", modal.preferred_lang) } else { modal.preferred_lang.clone() };
+    draw_text(hdc, &lang_display, chk_x + 8, lang_box_y, lang_box_w - 16, lang_box_h, fonts.regular, COLOR_TEXT_PRIMARY, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 3. OpenSubtitles API Key
+    let open_lbl_y = lang_box_y + 34;
+    draw_text(hdc, "OpenSubtitles REST API Key (Optional):", chk_x, open_lbl_y, modal_w - 36, 18, fonts.small, COLOR_TEXT_SECONDARY, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    let open_box_y = open_lbl_y + 20;
+    let full_box_w = modal_w - 36;
+    let open_box_h = 26;
+    let is_open_focused = modal.focused_field == SubModalFocusedField::OpenSubKey;
+    let is_open_hover = state.hovered_control == Some(HoverControl::SubModalOpenSubKeyInput);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        open_box_y,
+        full_box_w,
+        open_box_h,
+        4,
+        COLOR_BG,
+        Some(if is_open_focused { COLOR_ACCENT } else if is_open_hover { COLOR_BORDER_HOVER } else { COLOR_BORDER }),
+    );
+    let open_display = if modal.opensubtitles_key.is_empty() && !is_open_focused {
+        "Paste OpenSubtitles API Key (api.opensubtitles.com)...".to_string()
+    } else if is_open_focused {
+        format!("{}|", modal.opensubtitles_key)
+    } else {
+        modal.opensubtitles_key.clone()
+    };
+    draw_text(hdc, &open_display, chk_x + 8, open_box_y, full_box_w - 16, open_box_h, fonts.regular, if modal.opensubtitles_key.is_empty() && !is_open_focused { COLOR_TEXT_MUTED } else { COLOR_TEXT_PRIMARY }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 4. Jimaku API Key
+    let jimaku_lbl_y = open_box_y + 34;
+    draw_text(hdc, "Jimaku.cc API Key (Optional, anime Japanese subs):", chk_x, jimaku_lbl_y, modal_w - 36, 18, fonts.small, COLOR_TEXT_SECONDARY, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    let jimaku_box_y = jimaku_lbl_y + 20;
+    let is_jimaku_focused = modal.focused_field == SubModalFocusedField::JimakuKey;
+    let is_jimaku_hover = state.hovered_control == Some(HoverControl::SubModalJimakuKeyInput);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        jimaku_box_y,
+        full_box_w,
+        open_box_h,
+        4,
+        COLOR_BG,
+        Some(if is_jimaku_focused { COLOR_ACCENT } else if is_jimaku_hover { COLOR_BORDER_HOVER } else { COLOR_BORDER }),
+    );
+    let jimaku_display = if modal.jimaku_key.is_empty() && !is_jimaku_focused {
+        "Paste Jimaku API Key (jimaku.cc)...".to_string()
+    } else if is_jimaku_focused {
+        format!("{}|", modal.jimaku_key)
+    } else {
+        modal.jimaku_key.clone()
+    };
+    draw_text(hdc, &jimaku_display, chk_x + 8, jimaku_box_y, full_box_w - 16, open_box_h, fonts.regular, if modal.jimaku_key.is_empty() && !is_jimaku_focused { COLOR_TEXT_MUTED } else { COLOR_TEXT_PRIMARY }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 5. File association button
+    let assoc_btn_y = jimaku_box_y + 36;
+    let assoc_btn_h = 28;
+    let is_assoc_hover = state.hovered_control == Some(HoverControl::SubModalRegisterAssoc);
+    draw_rounded_rect(
+        hdc,
+        chk_x,
+        assoc_btn_y,
+        full_box_w,
+        assoc_btn_h,
+        4,
+        if is_assoc_hover { COLOR_SURFACE_HOVER } else { COLOR_SURFACE },
+        Some(if is_assoc_hover { COLOR_ACCENT } else { COLOR_BORDER }),
+    );
+    draw_text(
+        hdc,
+        "Register File Types (.mkv, .mp4, .webm, .avi, etc.)",
+        chk_x,
+        assoc_btn_y,
+        full_box_w,
+        assoc_btn_h,
+        fonts.small_bold,
+        if is_assoc_hover { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Status feedback
+    if let Some(ref fb) = modal.status_feedback {
+        draw_text(hdc, fb, chk_x, assoc_btn_y + 32, full_box_w, 18, fonts.small, COLOR_ACCENT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // 6. Save & Close button
+    let footer_y = modal_y + modal_h - 44;
+    let save_w = 110;
+    let save_h = 30;
+    let save_x = modal_x + modal_w - 18 - save_w;
+    let is_save_hover = state.hovered_control == Some(HoverControl::SubModalSave);
+    draw_rounded_rect(
+        hdc,
+        save_x,
+        footer_y,
+        save_w,
+        save_h,
+        4,
+        if is_save_hover { COLOR_ACCENT_HOVER } else { COLOR_ACCENT },
+        Some(COLOR_ACCENT_MUTED),
+    );
+    draw_text(
+        hdc,
+        "Save & Close",
+        save_x,
+        footer_y,
+        save_w,
+        save_h,
+        fonts.bold,
         COLOR_TEXT_PRIMARY,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );

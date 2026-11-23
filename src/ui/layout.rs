@@ -74,6 +74,8 @@ pub struct LayoutGeometry {
 
     // Drawer Subtitles tab
     pub sub_track_selector_rect: Rect,
+    pub btn_fetch_subs: Rect,
+    pub btn_sub_settings: Rect,
     pub subtitle_list_rect: Rect,
     pub btn_extract_ass: Rect,
 
@@ -172,12 +174,14 @@ impl LayoutGeometry {
 
         // Tab 1 Subtitles
         let sub_track_selector_rect = Rect::new(drawer_x + 12, 48, (drawer_w - 24).max(0), 30);
+        let btn_sub_settings = Rect::new((drawer_x + drawer_w - 12 - 30).max(drawer_x), 82, 30, 26);
+        let btn_fetch_subs = Rect::new(drawer_x + 12, 82, (btn_sub_settings.x - drawer_x - 16).max(0), 26);
         let btn_extract_ass = Rect::new(drawer_x + 12, (height - 48).max(0), (drawer_w - 24).max(0), 38);
         let subtitle_list_rect = Rect::new(
             drawer_x,
-            84,
+            112,
             drawer_w,
-            (btn_extract_ass.y - 88).max(0),
+            (btn_extract_ass.y - 116).max(0),
         );
 
         // Tab 2 Episodes
@@ -237,6 +241,8 @@ impl LayoutGeometry {
             tab_episodes,
             tab_nyaa,
             sub_track_selector_rect,
+            btn_fetch_subs,
+            btn_sub_settings,
             subtitle_list_rect,
             btn_extract_ass,
             ep_header_open_folder,

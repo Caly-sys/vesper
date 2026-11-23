@@ -1,6 +1,6 @@
 [package]
 name = "vesper"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Vesper Developers"]
 description = "Lightweight Windows Anime MKV Player & Subtitle Extractor"
@@ -23,6 +23,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
+    "Win32_System_Registry",
 ] }
 
 # Async & Networking
@@ -43,6 +44,9 @@ matroska = "0.30.1"
 matroska-demuxer = "0.8.1"
 arboard = "3.4"
 rfd = "0.15"
+flate2 = "1.0"
+lzma-rs = "0.3"
+base64 = "0.22"
 
 # Utilities & Logging
 parking_lot = "0.12"
@@ -52,6 +56,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
+souvlaki = "0.9.3"
 
 [features]
 default = []

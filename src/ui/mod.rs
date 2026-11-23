@@ -100,6 +100,15 @@ pub enum UiAction {
     ResetTrackerDefaults,
     CopyText(String),
     OpenExternal(String),
+    FetchSubtitles,
+    AttachExternalSubtitle(crate::subtitles::SubtitleSearchResult),
+    SaveSubtitleConfig {
+        auto_fetch: bool,
+        preferred_lang: String,
+        opensubtitles_key: Option<String>,
+        jimaku_key: Option<String>,
+    },
+    RegisterFileAssociations,
 }
 
 unsafe extern "system" fn video_host_wndproc(
@@ -813,6 +822,11 @@ impl VesperUi {
         self.video_child_hwnd.0 as isize
     }
 
+    /// Expose top-level parent HWND
+    pub fn main_hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self.parent_hwnd
+    }
+
     /// Window resize handler: updates layout geometry and resizes child video HWND
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
@@ -1090,6 +1104,8 @@ impl VesperUi {
                 self.state.current_path = path.clone();
                 self.set_title(title);
                 self.state.cues.clear();
+                self.state.fetched_subtitles.clear();
+                self.state.is_searching_subs = false;
                 self.state.active_cue_idx = None;
                 self.state.sub_popover_open = false;
                 self.state.audio_popover_open = false;
@@ -1396,7 +1412,41 @@ impl VesperUi {
                 self.request_redraw();
             }
 
-            AppEvent::OpenFilePath(_) | AppEvent::OpenFolderPath(_) | AppEvent::FileEnded => {}
+            AppEvent::SubtitleFetched { path, provider } => {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("subtitle");
+                self.state.status_message = Some((
+                    format!("Loaded subtitle ({provider}): {name}"),
+                    Instant::now(),
+                ));
+                self.request_redraw();
+            }
+
+            AppEvent::ExternalSubtitlesDiscovered(results) => {
+                self.state.is_searching_subs = false;
+                self.state.fetched_subtitles = results.clone();
+                if results.is_empty() {
+                    self.state.status_message = Some((
+                        "No external subtitles found".to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.state.status_message = Some((
+                        format!("Found {} external subtitle(s)", results.len()),
+                        Instant::now(),
+                    ));
+                }
+                self.request_redraw();
+            }
+
+            AppEvent::ExternalSubtitleSearching(searching) => {
+                self.state.is_searching_subs = *searching;
+                if *searching {
+                    self.state.fetched_subtitles.clear();
+                }
+                self.request_redraw();
+            }
+
+            AppEvent::OpenFilePath(_) | AppEvent::OpenFolderPath(_) | AppEvent::FileEnded | AppEvent::MediaKey(_) => {}
 
             AppEvent::MpvWakeup => {
                 self.request_redraw();
@@ -1641,6 +1691,65 @@ impl VesperUi {
             return;
         }
 
+        // Check subtitle & integration settings modal dialog if open
+        if self.state.sub_settings_modal.is_some() {
+            let modal_w = 520.min(self.geom.total_width - 40);
+            let modal_h = 420.min(self.geom.total_height - 60);
+            let modal_x = (self.geom.total_width - modal_w) / 2;
+            let modal_y = (self.geom.total_height - modal_h) / 2;
+
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
+
+            let chk_x = modal_x + 18;
+            let chk_y = modal_y + 52;
+            let chk_w = 16;
+            let chk_h = 16;
+
+            let lang_lbl_y = modal_y + 82;
+            let lang_box_y = lang_lbl_y + 20;
+            let lang_box_w = 120;
+            let lang_box_h = 26;
+
+            let open_lbl_y = lang_box_y + 34;
+            let open_box_y = open_lbl_y + 20;
+            let full_box_w = modal_w - 36;
+            let open_box_h = 26;
+
+            let jimaku_lbl_y = open_box_y + 34;
+            let jimaku_box_y = jimaku_lbl_y + 20;
+
+            let assoc_btn_y = jimaku_box_y + 36;
+            let assoc_btn_h = 28;
+
+            let footer_y = modal_y + modal_h - 44;
+            let save_w = 110;
+            let save_h = 30;
+            let save_x = modal_x + modal_w - 18 - save_w;
+
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalClose);
+            } else if Rect::new(chk_x, chk_y, chk_w + 350, chk_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalAutoFetchToggle);
+            } else if Rect::new(chk_x, lang_box_y, lang_box_w, lang_box_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalLangInput);
+            } else if Rect::new(chk_x, open_box_y, full_box_w, open_box_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalOpenSubKeyInput);
+            } else if Rect::new(chk_x, jimaku_box_y, full_box_w, open_box_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalJimakuKeyInput);
+            } else if Rect::new(chk_x, assoc_btn_y, full_box_w, assoc_btn_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalRegisterAssoc);
+            } else if Rect::new(save_x, footer_y, save_w, save_h).contains(px, py) {
+                new_hover = Some(HoverControl::SubModalSave);
+            }
+
+            self.state.hovered_control = new_hover;
+            self.state.tooltip = None;
+            return;
+        }
+
         // Check category dropdown items if open
         if self.state.category_dropdown_open {
             let dd = &self.geom.nyaa_category_dropdown;
@@ -1730,6 +1839,10 @@ impl VesperUi {
                     Tab::Subtitles => {
                         if self.geom.sub_track_selector_rect.contains(px, py) {
                             new_hover = Some(HoverControl::SubTrackSelector);
+                        } else if self.geom.btn_fetch_subs.contains(px, py) {
+                            new_hover = Some(HoverControl::FetchSubs);
+                        } else if self.geom.btn_sub_settings.contains(px, py) {
+                            new_hover = Some(HoverControl::SubSettings);
                         } else if self.geom.btn_extract_ass.contains(px, py) {
                             new_hover = Some(HoverControl::ExtractAss);
                             if self.state.is_streaming_torrent && !self.state.is_torrent_complete {
@@ -1740,28 +1853,54 @@ impl VesperUi {
                                 ));
                             }
                         } else if self.geom.subtitle_list_rect.contains(px, py) {
-                            let card_h = 70;
-                            let card_margin = 8;
                             let mut y =
                                 self.geom.subtitle_list_rect.y + 8 - self.state.sub_scroll_y;
-                            for (idx, _) in self.state.cues.iter().enumerate() {
-                                let card_r = Rect::new(
-                                    self.geom.subtitle_list_rect.x + 12,
-                                    y,
-                                    self.geom.subtitle_list_rect.w - 24,
-                                    card_h,
-                                );
-                                if card_r.contains(px, py) {
-                                    let copy_r =
-                                        Rect::new(card_r.right() - 56, card_r.y + 8, 48, 20);
-                                    if copy_r.contains(px, py) {
-                                        new_hover = Some(HoverControl::CueCopy(idx));
-                                    } else {
-                                        new_hover = Some(HoverControl::CueCard(idx));
+                            let list_r = &self.geom.subtitle_list_rect;
+
+                            if self.state.is_searching_subs {
+                                y += 42;
+                            }
+
+                            if !self.state.fetched_subtitles.is_empty() {
+                                y += 24;
+                                let card_h = 52;
+                                let card_margin = 6;
+                                for (idx, _) in self.state.fetched_subtitles.iter().enumerate() {
+                                    let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
+                                    if card_r.contains(px, py) {
+                                        new_hover = Some(HoverControl::AttachFetchedSub(idx));
+                                        break;
                                     }
-                                    break;
+                                    y += card_h + card_margin;
                                 }
-                                y += card_h + card_margin;
+
+                                if new_hover.is_none() && !self.state.cues.is_empty() {
+                                    y += 32;
+                                }
+                            }
+
+                            if new_hover.is_none() {
+                                let card_h = 70;
+                                let card_margin = 8;
+                                for (idx, _) in self.state.cues.iter().enumerate() {
+                                    let card_r = Rect::new(
+                                        self.geom.subtitle_list_rect.x + 12,
+                                        y,
+                                        self.geom.subtitle_list_rect.w - 24,
+                                        card_h,
+                                    );
+                                    if card_r.contains(px, py) {
+                                        let copy_r =
+                                            Rect::new(card_r.right() - 56, card_r.y + 8, 48, 20);
+                                        if copy_r.contains(px, py) {
+                                            new_hover = Some(HoverControl::CueCopy(idx));
+                                        } else {
+                                            new_hover = Some(HoverControl::CueCard(idx));
+                                        }
+                                        break;
+                                    }
+                                    y += card_h + card_margin;
+                                }
                             }
                         }
                     }
@@ -2245,6 +2384,131 @@ impl VesperUi {
             return true;
         }
 
+        // Subtitle & Integration settings modal click handling
+        if self.state.sub_settings_modal.is_some() {
+            let modal_w = 520.min(self.geom.total_width - 40);
+            let modal_h = 420.min(self.geom.total_height - 60);
+            let modal_x = (self.geom.total_width - modal_w) / 2;
+            let modal_y = (self.geom.total_height - modal_h) / 2;
+
+            let close_btn_w = 26;
+            let close_btn_h = 24;
+            let close_btn_x = modal_x + modal_w - 16 - close_btn_w;
+            let close_btn_y = modal_y + 12;
+
+            let chk_x = modal_x + 18;
+            let chk_y = modal_y + 52;
+            let chk_w = 16;
+            let chk_h = 16;
+
+            let lang_lbl_y = modal_y + 82;
+            let lang_box_y = lang_lbl_y + 20;
+            let lang_box_w = 120;
+            let lang_box_h = 26;
+
+            let open_lbl_y = lang_box_y + 34;
+            let open_box_y = open_lbl_y + 20;
+            let full_box_w = modal_w - 36;
+            let open_box_h = 26;
+
+            let jimaku_lbl_y = open_box_y + 34;
+            let jimaku_box_y = jimaku_lbl_y + 20;
+
+            let assoc_btn_y = jimaku_box_y + 36;
+            let assoc_btn_h = 28;
+
+            let footer_y = modal_y + modal_h - 44;
+            let save_w = 110;
+            let save_h = 30;
+            let save_x = modal_x + modal_w - 18 - save_w;
+
+            // Close
+            if Rect::new(close_btn_x, close_btn_y, close_btn_w, close_btn_h).contains(px, py) {
+                self.state.sub_settings_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Checkbox
+            if Rect::new(chk_x, chk_y, chk_w + 350, chk_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.sub_settings_modal {
+                    m.auto_fetch = !m.auto_fetch;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Language focus
+            if Rect::new(chk_x, lang_box_y, lang_box_w, lang_box_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.sub_settings_modal {
+                    m.focused_field = controls::SubModalFocusedField::Lang;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // OpenSubtitles key focus
+            if Rect::new(chk_x, open_box_y, full_box_w, open_box_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.sub_settings_modal {
+                    m.focused_field = controls::SubModalFocusedField::OpenSubKey;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Jimaku key focus
+            if Rect::new(chk_x, jimaku_box_y, full_box_w, open_box_h).contains(px, py) {
+                if let Some(ref mut m) = self.state.sub_settings_modal {
+                    m.focused_field = controls::SubModalFocusedField::JimakuKey;
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Register File Associations
+            if Rect::new(chk_x, assoc_btn_y, full_box_w, assoc_btn_h).contains(px, py) {
+                self.action_queue.push_back(UiAction::RegisterFileAssociations);
+                self.request_redraw();
+                return true;
+            }
+
+            // Save button
+            if Rect::new(save_x, footer_y, save_w, save_h).contains(px, py) {
+                if let Some(m) = self.state.sub_settings_modal.take() {
+                    let open_key = if m.opensubtitles_key.trim().is_empty() { None } else { Some(m.opensubtitles_key.trim().to_string()) };
+                    let jim_key = if m.jimaku_key.trim().is_empty() { None } else { Some(m.jimaku_key.trim().to_string()) };
+                    let lang = if m.preferred_lang.trim().is_empty() { "en".to_string() } else { m.preferred_lang.trim().to_string() };
+
+                    self.state.auto_fetch_subs = m.auto_fetch;
+                    self.state.preferred_sub_lang = lang.clone();
+                    self.state.opensubtitles_api_key = open_key.clone();
+                    self.state.jimaku_api_key = jim_key.clone();
+
+                    self.action_queue.push_back(UiAction::SaveSubtitleConfig {
+                        auto_fetch: m.auto_fetch,
+                        preferred_lang: lang,
+                        opensubtitles_key: open_key,
+                        jimaku_key: jim_key,
+                    });
+                }
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            // Clicking elsewhere clears focus
+            if let Some(ref mut m) = self.state.sub_settings_modal {
+                m.focused_field = controls::SubModalFocusedField::None;
+            }
+            self.request_redraw();
+            return true;
+        }
+
         // Category dropdown menu selection
         if self.state.category_dropdown_open {
             let dd = &self.geom.nyaa_category_dropdown;
@@ -2426,6 +2690,26 @@ impl VesperUi {
                         return true;
                     }
 
+                    if self.geom.btn_fetch_subs.contains(px, py) {
+                        self.action_queue.push_back(UiAction::FetchSubtitles);
+                        self.request_redraw();
+                        return true;
+                    }
+
+                    if self.geom.btn_sub_settings.contains(px, py) {
+                        self.state.sub_settings_modal = Some(controls::SubtitleSettingsModalState {
+                            auto_fetch: self.state.auto_fetch_subs,
+                            preferred_lang: self.state.preferred_sub_lang.clone(),
+                            opensubtitles_key: self.state.opensubtitles_api_key.clone().unwrap_or_default(),
+                            jimaku_key: self.state.jimaku_api_key.clone().unwrap_or_default(),
+                            focused_field: controls::SubModalFocusedField::None,
+                            status_feedback: None,
+                        });
+                        self.set_video_visible(false);
+                        self.request_redraw();
+                        return true;
+                    }
+
                     // Extract button (adaptive format)
                     if self.geom.btn_extract_ass.contains(px, py) {
                         if self.state.is_streaming_torrent && !self.state.is_torrent_complete {
@@ -2467,12 +2751,37 @@ impl VesperUi {
                         return true;
                     }
 
-                    // Subtitle cue card click & copy button
+                    // Subtitle cue card click & copy button & online subtitle attach
                     if self.geom.subtitle_list_rect.contains(px, py) {
-                        let card_h = 70;
-                        let card_margin = 8;
                         let mut y =
                             self.geom.subtitle_list_rect.y + 8 - self.state.sub_scroll_y;
+                        let list_r = &self.geom.subtitle_list_rect;
+
+                        if self.state.is_searching_subs {
+                            y += 42;
+                        }
+
+                        if !self.state.fetched_subtitles.is_empty() {
+                            y += 24;
+                            let card_h = 52;
+                            let card_margin = 6;
+                            for sub in &self.state.fetched_subtitles {
+                                let card_r = Rect::new(list_r.x + 12, y, list_r.w - 24, card_h);
+                                if card_r.contains(px, py) {
+                                    self.action_queue.push_back(UiAction::AttachExternalSubtitle(sub.clone()));
+                                    self.request_redraw();
+                                    return true;
+                                }
+                                y += card_h + card_margin;
+                            }
+
+                            if !self.state.cues.is_empty() {
+                                y += 32;
+                            }
+                        }
+
+                        let card_h = 70;
+                        let card_margin = 8;
                         let mut copy_target = None;
                         let mut seek_target = None;
 
@@ -2951,6 +3260,77 @@ impl VesperUi {
                 }
                 controls::TrackersFocusedField::None => return true,
             }
+        }
+
+        // Subtitle settings modal keyboard input
+        if let Some(ref mut modal) = self.state.sub_settings_modal {
+            if logical_key == &Key::Named(NamedKey::Escape) {
+                self.state.sub_settings_modal = None;
+                if self.state.duration > 0.0 {
+                    self.set_video_visible(true);
+                }
+                self.request_redraw();
+                return true;
+            }
+
+            if self.modifiers.control_key() {
+                if let Key::Character(s) = logical_key {
+                    if s.eq_ignore_ascii_case("v") {
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            if let Ok(text) = clip.get_text() {
+                                match modal.focused_field {
+                                    controls::SubModalFocusedField::Lang => {
+                                        modal.preferred_lang.push_str(text.trim());
+                                    }
+                                    controls::SubModalFocusedField::OpenSubKey => {
+                                        modal.opensubtitles_key.push_str(text.trim());
+                                    }
+                                    controls::SubModalFocusedField::JimakuKey => {
+                                        modal.jimaku_key.push_str(text.trim());
+                                    }
+                                    controls::SubModalFocusedField::None => {}
+                                }
+                                self.request_redraw();
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let field_target = match modal.focused_field {
+                controls::SubModalFocusedField::Lang => Some(&mut modal.preferred_lang),
+                controls::SubModalFocusedField::OpenSubKey => Some(&mut modal.opensubtitles_key),
+                controls::SubModalFocusedField::JimakuKey => Some(&mut modal.jimaku_key),
+                controls::SubModalFocusedField::None => None,
+            };
+
+            if let Some(buf) = field_target {
+                match logical_key {
+                    Key::Named(NamedKey::Backspace) => {
+                        buf.pop();
+                        self.request_redraw();
+                        return true;
+                    }
+                    Key::Named(NamedKey::Space) => {
+                        buf.push(' ');
+                        self.request_redraw();
+                        return true;
+                    }
+                    Key::Character(s) => {
+                        buf.push_str(s);
+                        self.request_redraw();
+                        return true;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        modal.focused_field = controls::SubModalFocusedField::None;
+                        self.request_redraw();
+                        return true;
+                    }
+                    _ => return true,
+                }
+            }
+            return true;
         }
 
         // Keyboard shortcuts for native file/folder dialogs: Ctrl+O and Ctrl+Shift+O

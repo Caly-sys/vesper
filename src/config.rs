@@ -40,6 +40,18 @@ pub struct VesperConfig {
 
     #[serde(default)]
     pub cached_remote_trackers: Vec<String>,
+
+    #[serde(default = "default_auto_fetch_subs")]
+    pub auto_fetch_subs: bool,
+
+    #[serde(default = "default_preferred_sub_lang")]
+    pub preferred_sub_lang: String,
+
+    #[serde(default)]
+    pub jimaku_api_key: Option<String>,
+
+    #[serde(default)]
+    pub opensubtitles_api_key: Option<String>,
 }
 
 pub type Config = VesperConfig;
@@ -84,6 +96,14 @@ pub fn default_tracker_list_url() -> String {
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".to_string()
 }
 
+pub fn default_auto_fetch_subs() -> bool {
+    true
+}
+
+pub fn default_preferred_sub_lang() -> String {
+    "en".to_string()
+}
+
 impl Default for VesperConfig {
     fn default() -> Self {
         Self {
@@ -98,6 +118,10 @@ impl Default for VesperConfig {
             tracker_list_url: default_tracker_list_url(),
             custom_trackers: Vec::new(),
             cached_remote_trackers: Vec::new(),
+            auto_fetch_subs: default_auto_fetch_subs(),
+            preferred_sub_lang: default_preferred_sub_lang(),
+            jimaku_api_key: None,
+            opensubtitles_api_key: None,
         }
     }
 }
@@ -423,6 +447,10 @@ mod tests {
         assert!(config.tracker_list_url.contains("ngosang/trackerslist"));
         assert!(config.custom_trackers.is_empty());
         assert!(config.cached_remote_trackers.is_empty());
+        assert!(config.auto_fetch_subs);
+        assert_eq!(config.preferred_sub_lang, "en");
+        assert_eq!(config.jimaku_api_key, None);
+        assert_eq!(config.opensubtitles_api_key, None);
     }
 
     #[test]
@@ -431,6 +459,21 @@ mod tests {
         let toml_str = toml::to_string(&config).expect("serialize");
         let parsed: VesperConfig = toml::from_str(&toml_str).expect("deserialize");
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_custom_sub_config_deserialization() {
+        let toml_data = r#"
+            auto_fetch_subs = false
+            preferred_sub_lang = "ja"
+            jimaku_api_key = "test_jimaku_key"
+            opensubtitles_api_key = "test_os_key"
+        "#;
+        let config: VesperConfig = toml::from_str(toml_data).expect("deserialize custom config");
+        assert!(!config.auto_fetch_subs);
+        assert_eq!(config.preferred_sub_lang, "ja");
+        assert_eq!(config.jimaku_api_key.as_deref(), Some("test_jimaku_key"));
+        assert_eq!(config.opensubtitles_api_key.as_deref(), Some("test_os_key"));
     }
 
     #[test]

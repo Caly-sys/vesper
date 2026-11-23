@@ -203,7 +203,28 @@ pub enum PlayerCommand {
     SetSubtitleTrack(i64),
     CycleAudio,
     SetAudioTrack(i64),
+    AddSubtitle(String),
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKeyAction {
+    Play,
+    Pause,
+    Toggle,
+    Next,
+    Previous,
+    Stop,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SubtitleSearchResult {
+    pub provider: String,
+    pub title: String,
+    pub lang: String,
+    pub format: String,
+    pub download_url: String,
+    pub file_name: String,
 }
 
 /// Application-wide events emitted by player, background workers, or UI
@@ -280,4 +301,12 @@ pub enum AppEvent {
     StatusMessage(String),
     /// Playback of current file completed (EOF)
     FileEnded,
+    /// Hardware / SMTC media key pressed
+    MediaKey(MediaKeyAction),
+    /// External subtitle successfully fetched
+    SubtitleFetched { path: PathBuf, provider: String },
+    /// Discovered list of external subtitles from keyless providers
+    ExternalSubtitlesDiscovered(Vec<SubtitleSearchResult>),
+    /// Searching state for external subtitles
+    ExternalSubtitleSearching(bool),
 }

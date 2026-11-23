@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use crate::types::{AudioTrack, SubCue, SubTrack};
 
@@ -711,4 +712,991 @@ fn is_font_attachment(name: &str, mime_type: &str) -> bool {
     mime_lower.contains("font")
         || mime_lower.contains("truetype")
         || mime_lower.contains("opentype")
+}
+
+/// Computes standard 64-bit OpenSubtitles file hash.
+/// Hash is the 64-bit sum of file size, first 64 KiB, and last 64 KiB.
+pub fn compute_opensubtitles_hash(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("Failed to read metadata: {e}"))?;
+    let file_size = metadata.len();
+
+    const HASH_CHUNK_SIZE: usize = 65536; // 64 KiB
+
+    if file_size < HASH_CHUNK_SIZE as u64 {
+        return Err("File too small for OpenSubtitles hash (minimum 64 KiB required)".to_string());
+    }
+
+    let mut hash: u64 = file_size;
+
+    // Sum first 64 KiB as 64-bit unsigned little-endian integers
+    let mut buf = [0u8; HASH_CHUNK_SIZE];
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("Failed reading first 64 KiB: {e}"))?;
+    for chunk in buf.chunks_exact(8) {
+        let val = u64::from_le_bytes(chunk.try_into().unwrap());
+        hash = hash.wrapping_add(val);
+    }
+
+    // Sum last 64 KiB as 64-bit unsigned little-endian integers
+    let seek_pos = file_size.saturating_sub(HASH_CHUNK_SIZE as u64);
+    file.seek(SeekFrom::Start(seek_pos))
+        .map_err(|e| format!("Failed seeking to last 64 KiB: {e}"))?;
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("Failed reading last 64 KiB: {e}"))?;
+    for chunk in buf.chunks_exact(8) {
+        let val = u64::from_le_bytes(chunk.try_into().unwrap());
+        hash = hash.wrapping_add(val);
+    }
+
+    Ok(format!("{:016x}", hash))
+}
+
+/// Extracts title and episode number from raw filename or release string.
+pub fn extract_title_and_episode(raw: &str) -> (String, Option<f32>) {
+    (
+        crate::episodes::clean_nyaa_title(raw),
+        crate::episodes::parse_episode_number(raw),
+    )
+}
+
+pub use crate::types::SubtitleSearchResult;
+
+/// Maps language name or ISO 639-1 code to ISO 639-2 three-letter code.
+pub fn map_lang_to_iso639_2(lang: &str) -> &'static str {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" | "english" => "eng",
+        "id" | "ind" | "indonesian" => "ind",
+        "ja" | "jpn" | "japanese" => "jpn",
+        "es" | "spa" | "spanish" => "spa",
+        "fr" | "fre" | "fra" | "french" => "fre",
+        "de" | "ger" | "deu" | "german" => "ger",
+        "pt" | "por" | "portuguese" | "pob" => "por",
+        "it" | "ita" | "italian" => "ita",
+        "ru" | "rus" | "russian" => "rus",
+        "zh" | "zho" | "zht" | "chi" | "chinese" => "chi",
+        "ko" | "kor" | "korean" => "kor",
+        "vi" | "vie" | "vietnamese" => "vie",
+        "th" | "tha" | "thai" => "tha",
+        "ar" | "ara" | "arabic" => "ara",
+        "hi" | "hin" | "hindi" => "hin",
+        "pl" | "pol" | "polish" => "pol",
+        "tr" | "tur" | "turkish" => "tur",
+        _ => "eng",
+    }
+}
+
+/// Checks whether a subtitle language matches a target user preferred language.
+pub fn matches_language(target_lang: &str, sub_lang: &str) -> bool {
+    let t_code = map_lang_to_iso639_2(target_lang);
+    let s_lower = sub_lang.trim().to_ascii_lowercase();
+    let s_code = map_lang_to_iso639_2(&s_lower);
+    t_code == s_code || s_lower.starts_with(target_lang) || target_lang.starts_with(&s_lower)
+}
+
+/// Decompresses raw downloaded bytes if formatted as XZ or Gzip.
+pub fn decompress_if_needed(data: &[u8], filename: &str) -> Vec<u8> {
+    use std::io::Read;
+
+    // 1. Check XZ magic bytes: FD 37 7A 58 5A 00
+    if data.len() >= 6 && &data[0..6] == b"\xFD7zXZ\x00" {
+        let mut out = Vec::new();
+        if lzma_rs::xz_decompress(&mut &data[..], &mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+
+    // 2. Check GZ magic bytes: 1F 8B
+    if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
+        let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+
+    // 3. Fallback on file extension
+    let lower_fn = filename.to_ascii_lowercase();
+    if lower_fn.ends_with(".xz") {
+        let mut out = Vec::new();
+        if lzma_rs::xz_decompress(&mut &data[..], &mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    } else if lower_fn.ends_with(".gz") {
+        let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            return out;
+        }
+    }
+
+    data.to_vec()
+}
+
+/// Strips trailing compression extensions (.xz, .gz).
+pub fn clean_sub_filename(name: &str) -> String {
+    let mut s = name.to_string();
+    if s.ends_with(".xz") || s.ends_with(".gz") {
+        s.truncate(s.len() - 3);
+    }
+    s
+}
+
+/// Extracts season and episode numbers from title string.
+pub fn parse_season_and_episode(raw: &str) -> (u32, u32) {
+    if let Ok(re) = regex::Regex::new(r"(?i)s(\d{1,2})\s*e(\d{1,3})") {
+        if let Some(caps) = re.captures(raw) {
+            let s = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(1);
+            let e = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(1);
+            return (s, e);
+        }
+    }
+
+    let season = if let Ok(re_s) = regex::Regex::new(r"(?i)(?:season|\bs)\s*(\d{1,2})") {
+        re_s.captures(raw).and_then(|caps| caps.get(1)).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(1)
+    } else {
+        1
+    };
+
+    let ep = crate::episodes::parse_episode_number(raw).map(|e| e as u32).unwrap_or(1);
+    (season, ep)
+}
+
+/// Parses IMDb ID from Cinemeta top search JSON response.
+pub fn parse_cinemeta_imdb_id(json_str: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    json.get("metas")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|meta| meta.get("imdb_id").or_else(|| meta.get("id")))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Parses subtitle attachments from AnimeTosho detail response JSON.
+pub fn parse_animetosho_attachments(
+    detail_json: &serde_json::Value,
+    ep_num: Option<f32>,
+    preferred_lang: &str,
+    out: &mut Vec<SubtitleSearchResult>,
+) {
+    let files = match detail_json.get("files").and_then(|f| f.as_array()) {
+        Some(f) => f,
+        None => return,
+    };
+
+    let matching_files: Vec<&serde_json::Value> = if let Some(ep) = ep_num {
+        let matched: Vec<&serde_json::Value> = files
+            .iter()
+            .filter(|f| {
+                let fn_str = f.get("filename").and_then(|n| n.as_str()).unwrap_or("");
+                crate::episodes::parse_episode_number(fn_str) == Some(ep)
+            })
+            .collect();
+        if matched.is_empty() {
+            files.iter().collect()
+        } else {
+            matched
+        }
+    } else {
+        files.iter().collect()
+    };
+
+    for file in matching_files {
+        let raw_fn = file.get("filename").and_then(|n| n.as_str()).unwrap_or("subtitle");
+        let attachments = match file.get("attachments").and_then(|a| a.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for att in attachments {
+            let att_type = att.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if att_type != "subtitle" {
+                continue;
+            }
+
+            let dl_url = match att.get("url").and_then(|u| u.as_str()) {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+
+            let info = att.get("info");
+            let format = info.and_then(|i| i.get("format")).and_then(|f| f.as_str()).unwrap_or("ASS");
+            let lang_code = info.and_then(|i| i.get("language_code")).and_then(|l| l.as_str()).unwrap_or("eng");
+            let lang_name = info.and_then(|i| i.get("language")).and_then(|l| l.as_str()).unwrap_or("English");
+            let title = info.and_then(|i| i.get("name")).and_then(|n| n.as_str()).unwrap_or(lang_name);
+
+            let clean_name = format!("{}_{}.{}", clean_sub_filename(raw_fn), lang_code, format.to_ascii_lowercase());
+
+            out.push(SubtitleSearchResult {
+                provider: "AnimeTosho".to_string(),
+                title: format!("{title} ({format})"),
+                lang: map_lang_to_iso639_2(lang_code).to_string(),
+                format: format.to_uppercase(),
+                download_url: dl_url,
+                file_name: clean_name,
+            });
+        }
+    }
+
+    let pref = preferred_lang.to_lowercase();
+    out.sort_by_key(|s| if matches_language(&pref, &s.lang) { 0 } else { 1 });
+}
+
+/// Queries AnimeTosho keyless API for matching subtitle attachments.
+pub async fn fetch_animetosho(
+    query: &str,
+    info_hash: Option<&str>,
+    ep_num: Option<f32>,
+    preferred_lang: &str,
+) -> Result<Vec<SubtitleSearchResult>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let search_term = if let Some(h) = info_hash {
+        h.trim().to_string()
+    } else {
+        query.trim().to_string()
+    };
+
+    if search_term.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base_urls = ["https://feed.animetosho.org", "https://feed.animetosho.net"];
+    let mut entries_json = None;
+
+    for base in &base_urls {
+        let url = format!("{base}/json?q={}", urlencoding::encode(&search_term));
+        if let Ok(res) = client.get(&url).header("User-Agent", "Vesper v0.3.0").send().await {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if json.as_array().map_or(false, |a| !a.is_empty()) {
+                        entries_json = Some((base, json));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let (base_domain, json) = match entries_json {
+        Some(pair) => pair,
+        None => return Ok(Vec::new()),
+    };
+
+    let entries = json.as_array().unwrap();
+    let mut results = Vec::new();
+
+    for entry in entries.iter().take(3) {
+        let id = match entry.get("id").and_then(|v| v.as_i64()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let detail_url = format!("{base_domain}/json?show=torrent&id={id}");
+        if let Ok(res) = client.get(&detail_url).header("User-Agent", "Vesper v0.3.0").send().await {
+            if res.status().is_success() {
+                if let Ok(detail_json) = res.json::<serde_json::Value>().await {
+                    parse_animetosho_attachments(&detail_json, ep_num, preferred_lang, &mut results);
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Queries Cinemeta to resolve IMDb ID, then queries OpenSubtitles v3 (keyless Stremio addon).
+pub async fn fetch_cinemeta_opensubtitles(
+    raw_title: &str,
+    preferred_lang: &str,
+) -> Result<Vec<SubtitleSearchResult>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (clean_title, ep_num) = extract_title_and_episode(raw_title);
+    let (season, episode) = parse_season_and_episode(raw_title);
+    let ep = ep_num.map(|n| n as u32).unwrap_or(episode);
+
+    let mut imdb_id = None;
+    let mut is_series = true;
+
+    // 1. Cinemeta series search
+    let series_url = format!(
+        "https://v3-cinemeta.strem.io/catalog/series/top/search={}.json",
+        urlencoding::encode(&clean_title)
+    );
+    if let Ok(res) = client.get(&series_url).header("User-Agent", "Vesper v0.3.0").send().await {
+        if res.status().is_success() {
+            if let Ok(text) = res.text().await {
+                imdb_id = parse_cinemeta_imdb_id(&text);
+            }
+        }
+    }
+
+    // 2. Cinemeta movie search fallback
+    if imdb_id.is_none() {
+        let movie_url = format!(
+            "https://v3-cinemeta.strem.io/catalog/movie/top/search={}.json",
+            urlencoding::encode(&clean_title)
+        );
+        if let Ok(res) = client.get(&movie_url).header("User-Agent", "Vesper v0.3.0").send().await {
+            if res.status().is_success() {
+                if let Ok(text) = res.text().await {
+                    imdb_id = parse_cinemeta_imdb_id(&text);
+                    is_series = false;
+                }
+            }
+        }
+    }
+
+    let imdb = match imdb_id {
+        Some(id) => id,
+        None => return Ok(Vec::new()),
+    };
+
+    // 3. OpenSubtitles v3 query
+    let sub_url = if is_series {
+        format!("https://opensubtitles-v3.strem.io/subtitles/series/{imdb}:{season}:{ep}.json")
+    } else {
+        format!("https://opensubtitles-v3.strem.io/subtitles/movie/{imdb}.json")
+    };
+
+    let sub_res = client
+        .get(&sub_url)
+        .header("User-Agent", "Vesper v0.3.0")
+        .send()
+        .await
+        .map_err(|e| format!("OpenSubtitles v3 error: {e}"))?;
+
+    if !sub_res.status().is_success() {
+        return Ok(Vec::new());
+    }
+
+    let sub_json: serde_json::Value = sub_res
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenSubtitles v3 json: {e}"))?;
+
+    let subtitles = match sub_json.get("subtitles").and_then(|s| s.as_array()) {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut results = Vec::new();
+    for sub in subtitles {
+        let dl_url = match sub.get("url").and_then(|u| u.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        let lang = sub.get("lang").and_then(|l| l.as_str()).unwrap_or("eng");
+        let sub_fn = sub.get("subtitleFileName").and_then(|f| f.as_str()).unwrap_or("subtitles.srt");
+
+        results.push(SubtitleSearchResult {
+            provider: "OpenSubtitles".to_string(),
+            title: sub_fn.to_string(),
+            lang: lang.to_string(),
+            format: "SRT".to_string(),
+            download_url: dl_url,
+            file_name: format!("{}_{}.srt", clean_title.replace(' ', "_"), lang),
+        });
+    }
+
+    let pref = preferred_lang.to_lowercase();
+    results.sort_by_key(|s| if matches_language(&pref, &s.lang) { 0 } else { 1 });
+
+    Ok(results)
+}
+
+/// Unified provider search running keyless default chain and optional API keys.
+pub async fn fetch_all_keyless_subtitles(
+    video_path: Option<&Path>,
+    raw_title: &str,
+    info_hash: Option<&str>,
+    ep_num: Option<f32>,
+    config: &crate::config::VesperConfig,
+) -> Vec<SubtitleSearchResult> {
+    let mut all = Vec::new();
+    let (clean_title, extracted_ep) = extract_title_and_episode(raw_title);
+    let ep = ep_num.or(extracted_ep);
+
+    // 1. AnimeTosho (Keyless - Primary for Anime)
+    if let Ok(mut at_subs) = fetch_animetosho(&clean_title, info_hash, ep, &config.preferred_sub_lang).await {
+        all.append(&mut at_subs);
+    }
+
+    // 2. Cinemeta + OpenSubtitles v3 (Keyless - Primary for TV & Movies)
+    if let Ok(mut os_subs) = fetch_cinemeta_opensubtitles(raw_title, &config.preferred_sub_lang).await {
+        all.append(&mut os_subs);
+    }
+
+    // 3. Optional Jimaku API key override
+    if let Some(ref j_key) = config.jimaku_api_key {
+        if !j_key.trim().is_empty() {
+            if let Ok(Some((fn_name, bytes))) = fetch_jimaku(&clean_title, ep, j_key).await {
+                // If downloaded directly, provide a data URI / memory marker
+                all.push(SubtitleSearchResult {
+                    provider: "Jimaku".to_string(),
+                    title: fn_name.clone(),
+                    lang: "jpn".to_string(),
+                    format: if fn_name.ends_with(".srt") { "SRT".to_string() } else { "ASS".to_string() },
+                    download_url: format!("data:application/octet-stream;base64,{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)),
+                    file_name: fn_name,
+                });
+            }
+        }
+    }
+
+    // 4. Optional OpenSubtitles REST API key override
+    if let Some(ref os_key) = config.opensubtitles_api_key {
+        if !os_key.trim().is_empty() {
+            if let Ok(Some((fn_name, bytes))) = fetch_opensubtitles(video_path, &clean_title, ep, &config.preferred_sub_lang, Some(os_key)).await {
+                all.push(SubtitleSearchResult {
+                    provider: "OpenSubtitles REST".to_string(),
+                    title: fn_name.clone(),
+                    lang: map_lang_to_iso639_2(&config.preferred_sub_lang).to_string(),
+                    format: if fn_name.ends_with(".ass") { "ASS".to_string() } else { "SRT".to_string() },
+                    download_url: format!("data:application/octet-stream;base64,{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)),
+                    file_name: fn_name,
+                });
+            }
+        }
+    }
+
+    // Prioritize preferred language matches first
+    let pref_3 = map_lang_to_iso639_2(&config.preferred_sub_lang);
+    all.sort_by_key(|s| {
+        if s.lang == pref_3 || matches_language(&config.preferred_sub_lang, &s.lang) {
+            0
+        } else {
+            1
+        }
+    });
+
+    all
+}
+
+/// Downloads subtitle bytes from HTTP URL or data URI, applying decompression.
+pub async fn download_subtitle_bytes(url: &str, filename: &str) -> Result<(String, Vec<u8>), String> {
+    if let Some(b64) = url.strip_prefix("data:application/octet-stream;base64,") {
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|e| format!("Base64 decode error: {e}"))?;
+        let decompressed = decompress_if_needed(&bytes, filename);
+        let clean_name = clean_sub_filename(filename);
+        return Ok((clean_name, decompressed));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let res = client
+        .get(url)
+        .header("User-Agent", "Vesper v0.3.0")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download subtitle from {url}: {e}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Subtitle download returned status {}", res.status()));
+    }
+
+    let bytes = res.bytes().await.map_err(|e| format!("Failed to read subtitle bytes: {e}"))?;
+    let decompressed = decompress_if_needed(&bytes, filename);
+    let clean_name = clean_sub_filename(filename);
+
+    Ok((clean_name, decompressed))
+}
+
+/// Fetches subtitles from OpenSubtitles.com API.
+/// Tries moviehash query first if path is provided, falling back to title & episode query.
+pub async fn fetch_opensubtitles(
+    path: Option<&Path>,
+    title: &str,
+    ep_num: Option<f32>,
+    lang: &str,
+    api_key: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let client = reqwest::Client::new();
+    let mut search_json: Option<serde_json::Value> = None;
+
+    // 1. Try moviehash query if path is provided
+    if let Some(p) = path {
+        if let Ok(hash) = compute_opensubtitles_hash(p) {
+            let url = format!(
+                "https://api.opensubtitles.com/api/v1/subtitles?languages={}&moviehash={}",
+                urlencoding::encode(lang),
+                urlencoding::encode(&hash)
+            );
+            let mut req = client.get(&url).header("User-Agent", "Vesper v0.3.0");
+            if let Some(key) = api_key {
+                if !key.trim().is_empty() {
+                    req = req.header("Api-Key", key.trim());
+                }
+            }
+
+            if let Ok(res) = req.send().await {
+                if res.status().is_success() {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        if json
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .map_or(false, |arr| !arr.is_empty())
+                        {
+                            search_json = Some(json);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to query by title and episode number
+    if search_json.is_none() {
+        let mut url = format!(
+            "https://api.opensubtitles.com/api/v1/subtitles?languages={}&query={}",
+            urlencoding::encode(lang),
+            urlencoding::encode(title)
+        );
+        if let Some(ep) = ep_num {
+            let ep_str = if ep.fract() == 0.0 {
+                (ep as u32).to_string()
+            } else {
+                ep.to_string()
+            };
+            url.push_str(&format!("&episode_number={}", urlencoding::encode(&ep_str)));
+        }
+
+        let mut req = client.get(&url).header("User-Agent", "Vesper v0.3.0");
+        if let Some(key) = api_key {
+            if !key.trim().is_empty() {
+                req = req.header("Api-Key", key.trim());
+            }
+        }
+
+        let res = req
+            .send()
+            .await
+            .map_err(|e| format!("OpenSubtitles search request failed: {e}"))?;
+
+        if !res.status().is_success() {
+            return Err(format!(
+                "OpenSubtitles search failed with status: {}",
+                res.status()
+            ));
+        }
+
+        let json: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse OpenSubtitles search response: {e}"))?;
+
+        if json
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map_or(false, |arr| !arr.is_empty())
+        {
+            search_json = Some(json);
+        }
+    }
+
+    let search_json = match search_json {
+        Some(j) => j,
+        None => return Ok(None),
+    };
+
+    let first_file = match search_json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("attributes"))
+        .and_then(|attr| attr.get("files"))
+        .and_then(|files| files.as_array())
+        .and_then(|files| files.first())
+    {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+
+    let file_id = match first_file.get("file_id").and_then(|id| id.as_i64()) {
+        Some(id) => serde_json::Value::Number(id.into()),
+        None => match first_file.get("file_id").and_then(|id| id.as_str()) {
+            Some(s) => match s.parse::<i64>() {
+                Ok(id) => serde_json::Value::Number(id.into()),
+                Err(_) => serde_json::Value::String(s.to_string()),
+            },
+            None => return Ok(None),
+        },
+    };
+
+    // 3. Request download URL
+    let mut dl_req = client
+        .post("https://api.opensubtitles.com/api/v1/download")
+        .header("User-Agent", "Vesper v0.3.0");
+    if let Some(key) = api_key {
+        if !key.trim().is_empty() {
+            dl_req = dl_req.header("Api-Key", key.trim());
+        }
+    }
+
+    let dl_res = dl_req
+        .json(&serde_json::json!({ "file_id": file_id }))
+        .send()
+        .await
+        .map_err(|e| format!("OpenSubtitles download request failed: {e}"))?;
+
+    if !dl_res.status().is_success() {
+        return Err(format!(
+            "OpenSubtitles download request returned status: {}",
+            dl_res.status()
+        ));
+    }
+
+    let dl_json: serde_json::Value = dl_res
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenSubtitles download response: {e}"))?;
+
+    let link = dl_json
+        .get("link")
+        .and_then(|l| l.as_str())
+        .ok_or_else(|| "OpenSubtitles download response missing 'link'".to_string())?;
+
+    let file_name = dl_json
+        .get("file_name")
+        .and_then(|n| n.as_str())
+        .or_else(|| first_file.get("file_name").and_then(|n| n.as_str()))
+        .unwrap_or("subtitles.srt")
+        .to_string();
+
+    let bytes = reqwest::get(link)
+        .await
+        .map_err(|e| format!("Failed to download subtitle file: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read subtitle bytes: {e}"))?;
+
+    Ok(Some((file_name, bytes.to_vec())))
+}
+
+/// Fetches Japanese/anime subtitles from Jimaku.cc API.
+pub async fn fetch_jimaku(
+    title: &str,
+    ep_num: Option<f32>,
+    api_key: &str,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    if api_key.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let client = reqwest::Client::new();
+
+    // 1. Search entries by title
+    let search_url = format!(
+        "https://jimaku.cc/api/entries/search?query={}",
+        urlencoding::encode(title)
+    );
+    let search_res = client
+        .get(&search_url)
+        .header("Authorization", api_key.trim())
+        .header("User-Agent", "Vesper v0.3.0")
+        .send()
+        .await
+        .map_err(|e| format!("Jimaku search request failed: {e}"))?;
+
+    if !search_res.status().is_success() {
+        return Err(format!(
+            "Jimaku search failed with status: {}",
+            search_res.status()
+        ));
+    }
+
+    let search_json: serde_json::Value = search_res
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Jimaku search JSON: {e}"))?;
+
+    let empty_vec = Vec::new();
+    let entries = search_json
+        .as_array()
+        .or_else(|| search_json.get("data").and_then(|d| d.as_array()))
+        .unwrap_or(&empty_vec);
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let entry_id = entries[0]
+        .get("id")
+        .and_then(|id| id.as_i64())
+        .map(|id| id.to_string())
+        .or_else(|| {
+            entries[0]
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| "Jimaku entry missing 'id'".to_string())?;
+
+    // 2. Fetch files for entry
+    let files_url = format!("https://jimaku.cc/api/entries/{entry_id}/files");
+    let files_res = client
+        .get(&files_url)
+        .header("Authorization", api_key.trim())
+        .header("User-Agent", "Vesper v0.3.0")
+        .send()
+        .await
+        .map_err(|e| format!("Jimaku files request failed: {e}"))?;
+
+    if !files_res.status().is_success() {
+        return Err(format!(
+            "Jimaku files request failed with status: {}",
+            files_res.status()
+        ));
+    }
+
+    let files_json: serde_json::Value = files_res
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Jimaku files JSON: {e}"))?;
+
+    let files = files_json
+        .as_array()
+        .or_else(|| files_json.get("data").and_then(|d| d.as_array()))
+        .or_else(|| files_json.get("files").and_then(|f| f.as_array()))
+        .unwrap_or(&empty_vec);
+
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    // 3. Select matching episode file or fallback to first file
+    let target_file = if let Some(ep) = ep_num {
+        files
+            .iter()
+            .find(|f| {
+                if let Some(f_ep) = f.get("episode").and_then(|e| e.as_f64()) {
+                    if (f_ep as f32 - ep).abs() < 0.01 {
+                        return true;
+                    }
+                }
+                let name = f
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .or_else(|| f.get("file_name").and_then(|n| n.as_str()))
+                    .or_else(|| f.get("filename").and_then(|n| n.as_str()))
+                    .unwrap_or_default();
+                if let Some(parsed_ep) = crate::episodes::parse_episode_number(name) {
+                    if (parsed_ep - ep).abs() < 0.01 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .unwrap_or(&files[0])
+    } else {
+        &files[0]
+    };
+
+    let file_name = target_file
+        .get("name")
+        .and_then(|n| n.as_str())
+        .or_else(|| target_file.get("file_name").and_then(|n| n.as_str()))
+        .or_else(|| target_file.get("filename").and_then(|n| n.as_str()))
+        .unwrap_or("subtitle.ass")
+        .to_string();
+
+    let dl_url = target_file
+        .get("url")
+        .and_then(|u| u.as_str())
+        .or_else(|| target_file.get("download_url").and_then(|u| u.as_str()))
+        .or_else(|| target_file.get("link").and_then(|u| u.as_str()))
+        .map(|u| {
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u.to_string()
+            } else if u.starts_with('/') {
+                format!("https://jimaku.cc{u}")
+            } else {
+                format!("https://jimaku.cc/{u}")
+            }
+        })
+        .or_else(|| {
+            target_file
+                .get("id")
+                .and_then(|id| id.as_i64())
+                .map(|id| format!("https://jimaku.cc/api/files/{id}"))
+        })
+        .ok_or_else(|| "Could not determine download URL for Jimaku file".to_string())?;
+
+    let dl_res = client
+        .get(&dl_url)
+        .header("Authorization", api_key.trim())
+        .header("User-Agent", "Vesper v0.3.0")
+        .send()
+        .await
+        .map_err(|e| format!("Jimaku file download error: {e}"))?;
+
+    if !dl_res.status().is_success() {
+        return Err(format!(
+            "Jimaku file download failed with status: {}",
+            dl_res.status()
+        ));
+    }
+
+    let bytes = dl_res
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read Jimaku file bytes: {e}"))?;
+
+    Ok(Some((file_name, bytes.to_vec())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_opensubtitles_hash() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "vesper_sub_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. File smaller than 64 KiB should return Err
+        let small_file = temp_dir.join("small.bin");
+        std::fs::write(&small_file, vec![0u8; 1024]).unwrap();
+        assert!(compute_opensubtitles_hash(&small_file).is_err());
+
+        // 2. 128 KiB dummy file with all zeroes:
+        // Size = 131072 (0x20000). Chunks sum to 0. Hash = 0x20000.
+        let zero_file = temp_dir.join("zeroes.bin");
+        std::fs::write(&zero_file, vec![0u8; 131072]).unwrap();
+        let hash = compute_opensubtitles_hash(&zero_file).expect("hash computed");
+        assert_eq!(hash, "0000000000020000");
+
+        // 3. 128 KiB file with non-zero bytes
+        let test_file = temp_dir.join("test.bin");
+        let mut data = vec![0u8; 131072];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[131072 - 8..131072].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&test_file, &data).unwrap();
+
+        let hash_val = compute_opensubtitles_hash(&test_file).expect("hash computed");
+        // Hash = 131072 + 1 + 2 = 131075 = 0x20003
+        assert_eq!(hash_val, "0000000000020003");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extract_title_and_episode() {
+        let raw1 = "[SubsPlease] Sousou no Frieren - 01 (1080p) [ABCD1234].mkv";
+        let (title1, ep1) = extract_title_and_episode(raw1);
+        assert_eq!(title1, "Sousou no Frieren - 01");
+        assert_eq!(ep1, Some(1.0));
+
+        let raw2 = "Spy x Family S01E05 (720p).mp4";
+        let (title2, ep2) = extract_title_and_episode(raw2);
+        assert_eq!(title2, "Spy x Family S01E05");
+        assert_eq!(ep2, Some(5.0));
+
+        let raw3 = "Movie Name (2024) [BD 1080p].mkv";
+        let (title3, ep3) = extract_title_and_episode(raw3);
+        assert_eq!(title3, "Movie Name (2024)");
+        assert_eq!(ep3, None);
+    }
+
+    #[test]
+    fn test_language_code_mapping() {
+        assert_eq!(map_lang_to_iso639_2("en"), "eng");
+        assert_eq!(map_lang_to_iso639_2("id"), "ind");
+        assert_eq!(map_lang_to_iso639_2("ja"), "jpn");
+        assert_eq!(map_lang_to_iso639_2("english"), "eng");
+        assert_eq!(map_lang_to_iso639_2("indonesian"), "ind");
+        assert_eq!(map_lang_to_iso639_2("japanese"), "jpn");
+        assert_eq!(map_lang_to_iso639_2("es"), "spa");
+
+        assert!(matches_language("en", "eng"));
+        assert!(matches_language("en", "English"));
+        assert!(matches_language("id", "ind"));
+        assert!(matches_language("ja", "jpn"));
+    }
+
+    #[test]
+    fn test_cinemeta_imdb_extraction() {
+        let json = r#"{"metas":[{"id":"tt22248376","imdb_id":"tt22248376","type":"series","name":"Frieren: Beyond Journey's End"}]}"#;
+        let imdb_id = parse_cinemeta_imdb_id(json);
+        assert_eq!(imdb_id, Some("tt22248376".to_string()));
+
+        let fallback_json = r#"{"metas":[{"id":"tt0185906","type":"movie","name":"Band of Brothers"}]}"#;
+        let fallback_id = parse_cinemeta_imdb_id(fallback_json);
+        assert_eq!(fallback_id, Some("tt0185906".to_string()));
+
+        let empty_json = r#"{"metas":[]}"#;
+        assert_eq!(parse_cinemeta_imdb_id(empty_json), None);
+    }
+
+    #[test]
+    fn test_animetosho_json_parsing() {
+        let sample = serde_json::json!({
+            "id": 687355,
+            "files": [
+                {
+                    "filename": "Frieren - Beyond Journey's End - S01E01.mkv",
+                    "attachments": [
+                        {
+                            "id": 12345,
+                            "type": "subtitle",
+                            "url": "https://storage.animetosho.net/attachments/10003/sample.eng.ass.xz",
+                            "info": {
+                                "format": "ASS",
+                                "language": "English",
+                                "language_code": "eng",
+                                "name": "Full Subtitles [9volt]"
+                            }
+                        },
+                        {
+                            "id": 12346,
+                            "type": "font",
+                            "url": "https://storage.animetosho.net/attachments/font.ttf"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let mut results = Vec::new();
+        parse_animetosho_attachments(&sample, Some(1.0), "en", &mut results);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "AnimeTosho");
+        assert_eq!(results[0].lang, "eng");
+        assert_eq!(results[0].format, "ASS");
+        assert_eq!(results[0].download_url, "https://storage.animetosho.net/attachments/10003/sample.eng.ass.xz");
+    }
+
+    #[test]
+    fn test_decompress_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"1\n00:00:01,000 --> 00:00:02,000\nHello World\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(original).unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        let decompressed = decompress_if_needed(&gzipped, "test.srt.gz");
+        assert_eq!(decompressed, original);
+    }
 }

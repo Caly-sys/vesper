@@ -9,6 +9,7 @@ mod subtitles;
 mod torrent;
 mod types;
 mod ui;
+mod windows_integration;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,6 +40,33 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,vesper=debug")),
         )
         .try_init();
+
+    // Check command line arguments for association flags
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--register") {
+        match windows_integration::WindowsIntegration::register_file_associations() {
+            Ok(()) => {
+                println!("Vesper file associations successfully registered (.mkv, .mp4, .webm, .mov, .avi, .m4v).");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Failed to register file associations: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--unregister") {
+        match windows_integration::WindowsIntegration::unregister_file_associations() {
+            Ok(()) => {
+                println!("Vesper file associations successfully unregistered.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Failed to unregister file associations: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     info!("Starting Vesper Anime Player...");
 
@@ -115,6 +143,10 @@ fn main() -> Result<()> {
     ui.state.tracker_list_url = config.tracker_list_url.clone();
     ui.state.custom_trackers = config.custom_trackers.clone();
     ui.state.cached_remote_trackers = config.cached_remote_trackers.clone();
+    ui.state.auto_fetch_subs = config.auto_fetch_subs;
+    ui.state.preferred_sub_lang = config.preferred_sub_lang.clone();
+    ui.state.jimaku_api_key = config.jimaku_api_key.clone();
+    ui.state.opensubtitles_api_key = config.opensubtitles_api_key.clone();
 
     // Verify and populate completed downloads and watch progress from state registry
     for (hash, item) in &vesper_state.completed_torrents {
@@ -128,6 +160,7 @@ fn main() -> Result<()> {
 
     ui.init_overlay();
     let video_hwnd = ui.video_hwnd();
+    let mut windows_integration = windows_integration::WindowsIntegration::new(ui.main_hwnd(), event_proxy.clone());
 
     // Initialize in-memory tracker pool with merged trackers
     let initial_trackers = crate::stream::merge_trackers(&[], &config);
@@ -414,13 +447,16 @@ fn main() -> Result<()> {
                                         if let Some(cue) = cue_buffer.get_active_cue(*pos) {
                                             ui.handle_app_event(&AppEvent::SubCueEmitted(cue.clone()));
                                         }
+                                        windows_integration.update_playback_state(true, *pos, current_duration);
                                         ui.handle_app_event(&ev);
                                     }
                                     AppEvent::DurationChanged(dur) => {
                                         current_duration = *dur;
+                                        windows_integration.update_playback_state(true, current_playback_time, *dur);
                                         ui.handle_app_event(&ev);
                                     }
                                     AppEvent::PauseChanged(paused) => {
+                                        windows_integration.update_playback_state(!*paused, current_playback_time, current_duration);
                                         if *paused {
                                             if let Some(ref path) = current_file_path {
                                                 let path_str = path.display().to_string();
@@ -447,10 +483,20 @@ fn main() -> Result<()> {
                                     }
                                     AppEvent::FileLoaded { title, duration, path } => {
                                         current_duration = *duration;
+                                        current_playback_time = 0.0;
+                                        windows_integration.update_metadata(title, *duration);
+                                        windows_integration.update_playback_state(true, 0.0, *duration);
+
                                         if let Some(p) = path {
                                             current_file_path = Some(p.clone());
                                             let siblings = episodes::scan_sibling_episodes(p);
                                             ui.handle_app_event(&AppEvent::EpisodesLoaded(siblings));
+                                        }
+
+                                        let tracks = p.get_sub_tracks();
+                                        let has_sidecar = path.as_deref().map(has_sidecar_subtitles).unwrap_or(false);
+                                        if tracks.is_empty() && !has_sidecar && config.auto_fetch_subs {
+                                            spawn_subtitle_fetch(path.clone(), title.clone(), current_file_hash.clone(), true, config.clone(), event_proxy.clone());
                                         }
 
                                         // Auto-resume from saved watch progress if between 10.0s and 95% duration
@@ -490,6 +536,7 @@ fn main() -> Result<()> {
                                         ui.handle_app_event(&ev);
                                     }
                                     AppEvent::FileEnded => {
+                                        windows_integration.clear_progress();
                                         info!("Playback reached EOF; advancing to next episode");
                                         ui.play_next_episode();
                                     }
@@ -556,6 +603,45 @@ fn main() -> Result<()> {
                         ui.play_next_episode();
                     }
 
+                    AppEvent::MediaKey(action) => {
+                        match action {
+                            crate::types::MediaKeyAction::Play => {
+                                if let Some(p) = player.as_mut() { let _ = p.play(); }
+                            }
+                            crate::types::MediaKeyAction::Pause => {
+                                if let Some(p) = player.as_mut() { let _ = p.pause(); }
+                            }
+                            crate::types::MediaKeyAction::Toggle => {
+                                if let Some(p) = player.as_mut() { let _ = p.toggle_pause(); }
+                            }
+                            crate::types::MediaKeyAction::Next => {
+                                ui.play_next_episode();
+                            }
+                            crate::types::MediaKeyAction::Previous => {
+                                if current_playback_time > 3.0 {
+                                    if let Some(p) = player.as_mut() { let _ = p.seek_absolute(0.0); }
+                                } else if let Some(cur) = ui.state.active_ep_idx {
+                                    if cur > 0 {
+                                        ui.state.active_ep_idx = Some(cur - 1);
+                                        // Play prev
+                                    }
+                                }
+                            }
+                            crate::types::MediaKeyAction::Stop => {
+                                if let Some(p) = player.as_mut() { let _ = p.stop(); }
+                                ui.set_video_visible(false);
+                            }
+                        }
+                    }
+
+                    AppEvent::SubtitleFetched { path, provider } => {
+                        if let Some(p) = player.as_mut() {
+                            let _ = p.add_subtitle(&path.display().to_string());
+                        }
+                        ui.handle_app_event(&AppEvent::StatusMessage(format!("Loaded subtitle from {provider}")));
+                        ui.request_redraw();
+                    }
+
                     AppEvent::EpisodesLoaded(_)
                     | AppEvent::TracksLoaded(_)
                     | AppEvent::AudioTracksLoaded(_)
@@ -573,6 +659,8 @@ fn main() -> Result<()> {
                     | AppEvent::TorrentDownloadsUpdated(_)
                     | AppEvent::SubtitleExtracted { .. }
                     | AppEvent::SubtitleExtractionError(_)
+                    | AppEvent::ExternalSubtitlesDiscovered(_)
+                    | AppEvent::ExternalSubtitleSearching(_)
                     | AppEvent::StatusMessage(_) => {
                         ui.handle_app_event(&app_event);
                     }
@@ -1560,6 +1648,99 @@ fn main() -> Result<()> {
                                 window.set_fullscreen(None);
                             }
                         }
+
+                        UiAction::RegisterFileAssociations => {
+                            match windows_integration::WindowsIntegration::register_file_associations() {
+                                Ok(()) => {
+                                    if let Some(ref mut m) = ui.state.sub_settings_modal {
+                                        m.status_feedback = Some("File associations registered (.mkv, .mp4, etc.)".to_string());
+                                    }
+                                    ui.handle_app_event(&AppEvent::StatusMessage("File associations registered (.mkv, .mp4, etc.)".to_string()));
+                                }
+                                Err(e) => {
+                                    if let Some(ref mut m) = ui.state.sub_settings_modal {
+                                        m.status_feedback = Some(format!("Error: {e}"));
+                                    }
+                                }
+                            }
+                            ui.request_redraw();
+                        }
+
+                        UiAction::SaveSubtitleConfig {
+                            auto_fetch,
+                            preferred_lang,
+                            opensubtitles_key,
+                            jimaku_key,
+                        } => {
+                            config.auto_fetch_subs = auto_fetch;
+                            config.preferred_sub_lang = preferred_lang;
+                            config.opensubtitles_api_key = opensubtitles_key;
+                            config.jimaku_api_key = jimaku_key;
+                            let _ = config.save();
+                            ui.handle_app_event(&AppEvent::StatusMessage("Subtitle settings saved".to_string()));
+                        }
+
+                        UiAction::AttachExternalSubtitle(sub) => {
+                            let v_path = current_file_path.clone();
+                            let cfg = config.clone();
+                            let proxy = event_proxy.clone();
+                            ui.handle_app_event(&AppEvent::StatusMessage(format!("Downloading {} subtitle...", sub.lang.to_uppercase())));
+                            std::thread::spawn(move || {
+                                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                                    Ok(rt) => rt,
+                                    Err(_) => return,
+                                };
+                                rt.block_on(async move {
+                                    match crate::subtitles::download_subtitle_bytes(&sub.download_url, &sub.file_name).await {
+                                        Ok((clean_fn, data)) => {
+                                            let ext = std::path::Path::new(&clean_fn)
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .unwrap_or(if sub.format.eq_ignore_ascii_case("ass") { "ass" } else { "srt" });
+
+                                            let save_path = if let Some(ref vp) = v_path {
+                                                let parent = vp.parent().unwrap_or(std::path::Path::new("."));
+                                                let stem = vp.file_stem().and_then(|s| s.to_str()).unwrap_or("sub");
+                                                parent.join(format!("{stem}.{}.{ext}", sub.lang))
+                                            } else {
+                                                let safe_title = clean_fn.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
+                                                let _ = std::fs::create_dir_all(&cfg.cache_dir);
+                                                cfg.cache_dir.join(format!("{safe_title}.{}.{ext}", sub.lang))
+                                            };
+
+                                            if std::fs::write(&save_path, &data).is_ok() {
+                                                let _ = proxy.send_event(AppEvent::SubtitleFetched {
+                                                    path: save_path,
+                                                    provider: sub.provider,
+                                                });
+                                            } else {
+                                                let _ = proxy.send_event(AppEvent::StatusMessage("Failed to save downloaded subtitle".to_string()));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = proxy.send_event(AppEvent::StatusMessage(format!("Subtitle download failed: {e}")));
+                                        }
+                                    }
+                                });
+                            });
+                        }
+
+                        UiAction::FetchSubtitles => {
+                            let raw_title = current_file_path.as_ref()
+                                .and_then(|p| p.file_name())
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| {
+                                    if let Some(ep_idx) = ui.state.active_ep_idx {
+                                        ui.state.episodes.get(ep_idx).map(|e| e.clean_title.clone()).unwrap_or_else(|| "Video".to_string())
+                                    } else {
+                                        "Video".to_string()
+                                    }
+                                });
+                            let _ = event_proxy.send_event(AppEvent::ExternalSubtitleSearching(true));
+                            ui.handle_app_event(&AppEvent::StatusMessage(format!("Searching subtitles for '{raw_title}'...")));
+                            spawn_subtitle_fetch(current_file_path.clone(), raw_title, current_file_hash.clone(), false, config.clone(), event_proxy.clone());
+                        }
                     }
                 }
             }
@@ -1573,4 +1754,105 @@ fn main() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+fn has_sidecar_subtitles(video_path: &std::path::Path) -> bool {
+    let stem = match video_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_lowercase(),
+        None => return false,
+    };
+    let parent = match video_path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_lowercase();
+                if ext_lower == "srt" || ext_lower == "ass" || ext_lower == "vtt" {
+                    if let Some(f_stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        if f_stem.to_lowercase().starts_with(&stem) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn spawn_subtitle_fetch(
+    video_path: Option<PathBuf>,
+    raw_title: String,
+    info_hash: Option<String>,
+    auto_attach: bool,
+    config: VesperConfig,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+
+        rt.block_on(async move {
+            let (clean_title, ep_num) = crate::subtitles::extract_title_and_episode(&raw_title);
+
+            let results = crate::subtitles::fetch_all_keyless_subtitles(
+                video_path.as_deref(),
+                &raw_title,
+                info_hash.as_deref(),
+                ep_num,
+                &config,
+            ).await;
+
+            let _ = proxy.send_event(AppEvent::ExternalSubtitlesDiscovered(results.clone()));
+
+            if results.is_empty() {
+                if !auto_attach {
+                    let _ = proxy.send_event(AppEvent::StatusMessage(
+                        format!("No external subtitles found for '{clean_title}'"),
+                    ));
+                }
+                return;
+            }
+
+            if auto_attach {
+                if let Some(best) = results.first() {
+                    match crate::subtitles::download_subtitle_bytes(&best.download_url, &best.file_name).await {
+                        Ok((clean_fn, data)) => {
+                            let ext = std::path::Path::new(&clean_fn)
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or(if best.format.eq_ignore_ascii_case("ass") { "ass" } else { "srt" });
+
+                            let save_path = if let Some(ref vp) = video_path {
+                                let parent = vp.parent().unwrap_or(std::path::Path::new("."));
+                                let stem = vp.file_stem().and_then(|s| s.to_str()).unwrap_or("sub");
+                                parent.join(format!("{stem}.{}.{ext}", best.lang))
+                            } else {
+                                let safe_title = clean_title.replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-', "_");
+                                let _ = std::fs::create_dir_all(&config.cache_dir);
+                                config.cache_dir.join(format!("{safe_title}.{}.{ext}", best.lang))
+                            };
+
+                            if std::fs::write(&save_path, &data).is_ok() {
+                                let _ = proxy.send_event(AppEvent::SubtitleFetched {
+                                    path: save_path,
+                                    provider: best.provider.clone(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            let _ = proxy.send_event(AppEvent::StatusMessage(
+                                format!("Auto subtitle download failed: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+    });
 }

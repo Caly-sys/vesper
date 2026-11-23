@@ -225,6 +225,14 @@ impl Player {
         Ok(())
     }
 
+    /// Add and select an external subtitle file
+    pub fn add_subtitle(&mut self, path: &str) -> Result<()> {
+        self.mpv
+            .command("sub-add", &[path, "select"])
+            .context("Failed to add external subtitle")?;
+        Ok(())
+    }
+
     /// Automatically optimizes subtitle track selection when media loads:
     /// - If currently selected subtitle track is a signs/songs or forced track, but a full dialogue
     ///   track exists for the same language, select the full dialogue track.
@@ -285,6 +293,7 @@ impl Player {
             PlayerCommand::SetSubtitleTrack(id) => self.set_subtitle_track(id),
             PlayerCommand::CycleAudio => self.cycle_audio(),
             PlayerCommand::SetAudioTrack(id) => self.set_audio_track(id),
+            PlayerCommand::AddSubtitle(path) => self.add_subtitle(&path),
             PlayerCommand::Stop => self.stop(),
         }
     }
