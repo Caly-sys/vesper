@@ -418,16 +418,20 @@ impl Player {
                         if reason == libmpv2::mpv_end_file_reason::Eof {
                             out_events.push(AppEvent::FileEnded);
                         } else if reason == libmpv2::mpv_end_file_reason::Error {
-                            out_events.push(AppEvent::StatusMessage(
-                                "Playback error: file corrupted or unsupported codec".to_string(),
-                            ));
+                            let msg = diagnose_playback_error(
+                                self.current_file.as_deref(),
+                                "Playback error: file corrupted or unsupported codec",
+                            );
+                            out_events.push(AppEvent::StatusMessage(msg));
                         }
                     }
                     _ => {}
                 },
                 Err(e) => {
                     tracing::warn!("mpv wait_event returned error: {:?}", e);
-                    out_events.push(AppEvent::StatusMessage(format!("Playback error: {e}")));
+                    let fallback = format!("Playback error: {e}");
+                    let msg = diagnose_playback_error(self.current_file.as_deref(), &fallback);
+                    out_events.push(AppEvent::StatusMessage(msg));
                 }
             }
         }
@@ -690,6 +694,22 @@ pub fn clean_audio_codec(raw: &str) -> String {
     }
 }
 
+/// Inspects local media file on error to produce actionable diagnostics.
+fn diagnose_playback_error(path: Option<&std::path::Path>, default_msg: &str) -> String {
+    if let Some(p) = path {
+        if let Ok(mut f) = std::fs::File::open(p) {
+            use std::io::Read;
+            let mut buf = [0u8; 64];
+            if let Ok(n) = f.read(&mut buf) {
+                if n > 0 && buf[..n].iter().all(|&b| b == 0) {
+                    return "Playback error: file is incomplete (all zeroes, unfinished download)".to_string();
+                }
+            }
+        }
+    }
+    default_msg.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +736,20 @@ mod tests {
         assert_eq!(clean_audio_codec("truehd"), "TrueHD");
         assert_eq!(clean_audio_codec("vorbis"), "OGG");
         assert_eq!(clean_audio_codec("mp3"), "MP3");
+    }
+
+    #[test]
+    fn test_diagnose_playback_error() {
+        let temp = std::env::temp_dir().join("vesper_zero_test.bin");
+        std::fs::write(&temp, [0u8; 128]).unwrap();
+        let diag = diagnose_playback_error(Some(&temp), "fallback");
+        assert!(diag.contains("incomplete"));
+        let _ = std::fs::remove_file(&temp);
+
+        let temp_valid = std::env::temp_dir().join("vesper_valid_test.bin");
+        std::fs::write(&temp_valid, [0x1a, 0x45, 0xdf, 0xa3]).unwrap();
+        let diag_valid = diagnose_playback_error(Some(&temp_valid), "fallback error");
+        assert_eq!(diag_valid, "fallback error");
+        let _ = std::fs::remove_file(&temp_valid);
     }
 }
